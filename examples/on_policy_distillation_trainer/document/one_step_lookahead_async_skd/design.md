@@ -81,6 +81,8 @@ worker.generate_sequence_single(sample) x 24:
 
 이 single-sample primitive는 base `AgentLoopWorker`가 아니라 `AsyncSkdAgentLoopWorker(AgentLoopWorker)`에 둔다. `AgentLoopWorker`는 기존 generic batch path를 유지하고, SKD async 전용 primitive는 별도 worker subclass에 격리한다.
 
+`AsyncSkdAgentLoopWorker` exposes two execution primitives. `generate_sequence_single()` fully completes a single base sample and returns `DataProto`. `generate_skd_until_boundary()` advances a fresh or resumed SKD sample until `TERMINATED` or the next exportable committed-unit boundary and returns `AsyncSkdSample`.
+
 Lookahead는 이 sample-level completion visibility 위에 붙인다. Base batch가 끝나면 `drain_requested=True`가 되고, active lookahead task는 강제 cancel하지 않는다. 대신 `skd_agent_loop.py`가 제공하는 cooperative boundary return을 사용한다.
 
 ```text

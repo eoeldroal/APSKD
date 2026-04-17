@@ -554,6 +554,8 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
 
 `AsyncSkdAgentLoopWorker`는 `AgentLoopWorker`를 상속한다. 기존 batch path의 핵심 helper는 재사용하되, async SKD 전용 primitive는 base `AgentLoopWorker`에 추가하지 않는다.
 
+`generate_skd_until_boundary()` is the only worker API that may return partial samples. `generate_sequence_single()` remains completed-only. This separation is intentional: base samples use the completed-only path, while lookahead/carryover samples use the boundary path.
+
 ### 7.2 Move/Add `generate_sequence_single()`
 
 ```python
@@ -580,7 +582,7 @@ async def generate_sequence_single(
 - Tail filling은 sample completion event가 있어야 가능하다.
 - 이 primitive는 async SKD manager 전용이므로 `AsyncSkdAgentLoopWorker`에 둔다.
 
-### 7.3 Add SKD Boundary Primitive Later
+### 7.3 Add SKD Boundary Primitive
 
 ```python
 async def generate_skd_until_boundary(...) -> AsyncSkdSample:
@@ -1133,7 +1135,7 @@ Changes:
 - `skd_pending_turn_response_ids`
 - `_run_until_exportable_boundary()`
 - tool/interact macro-step closure before export
-- later `AsyncSkdAgentLoopWorker.generate_skd_until_boundary()`
+- `AsyncSkdAgentLoopWorker.generate_skd_until_boundary()`
 
 Expected behavior:
 
