@@ -22,9 +22,7 @@ def _object_array(values: list[Any]) -> np.ndarray:
 
 @pytest.mark.asyncio
 async def test_async_skd_worker_generate_sequence_single_runs_exactly_one_sample_on_cpu():
-    class _DummyWorker:
-        generate_sequence_single = AsyncSkdAgentLoopWorker.generate_sequence_single
-        _postprocess = AsyncSkdAgentLoopWorker._postprocess
+    class _DummyWorker(AsyncSkdAgentLoopWorker):
         reward_loop_worker_handles = None
         distillation_enabled = False
         stream_teacher_with_rollout = False
