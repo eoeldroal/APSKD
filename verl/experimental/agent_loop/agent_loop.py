@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -39,6 +40,7 @@ from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.monkey_patch_timing import monkey_patch_log_timing, monkey_patch_timing_begin
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
@@ -59,6 +61,23 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+# MONKEY PATCH: timing instrumentation toggles for rollout / teacher / reward hotspot analysis.
+_MONKEY_PATCH_TIMING_ENABLED = os.getenv("VERL_MONKEY_PATCH_TIMING", "0") == "1"
+_MONKEY_PATCH_TIMING_SLOW_MS = float(os.getenv("VERL_MONKEY_PATCH_TIMING_SLOW_MS", "50"))
+
+
+def _monkey_patch_log_timing(name: str, start_time: float, **extra: Any) -> None:
+    """MONKEY PATCH: emit searchable timing logs for slow async rollout substeps."""
+    monkey_patch_log_timing(
+        logger,
+        name,
+        start_time,
+        enabled=_MONKEY_PATCH_TIMING_ENABLED,
+        slow_ms=_MONKEY_PATCH_TIMING_SLOW_MS,
+        **extra,
+    )
 
 
 @ray.remote
@@ -160,8 +179,18 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        total_timer = monkey_patch_timing_begin(capture_gpu=True)
+        acquire_timer = monkey_patch_timing_begin(capture_gpu=False)
         server_id, server = await self._acquire_server(request_id)
+        _monkey_patch_log_timing(
+            "AsyncLLMServerManager.generate.acquire_server",
+            acquire_timer,
+            prompt_len=len(prompt_ids),
+            has_images=bool(image_data),
+            has_videos=bool(video_data),
+        )
         try:
+            generate_timer = monkey_patch_timing_begin(capture_gpu=True)
             output: TokenOutput | DiffusionOutput = await server.generate.remote(
                 request_id=uuid4().hex,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
@@ -170,9 +199,29 @@ class AsyncLLMServerManager:
                 video_data=video_data,
                 **kwargs,
             )
+            _monkey_patch_log_timing(
+                "AsyncLLMServerManager.generate.server_generate",
+                generate_timer,
+                prompt_len=len(prompt_ids),
+                has_images=bool(image_data),
+                has_videos=bool(video_data),
+            )
+            _monkey_patch_log_timing(
+                "AsyncLLMServerManager.generate.total",
+                total_timer,
+                prompt_len=len(prompt_ids),
+                has_images=bool(image_data),
+                has_videos=bool(video_data),
+            )
             return output
         finally:
+            release_timer = monkey_patch_timing_begin(capture_gpu=False)
             self._release_server(server_id)
+            _monkey_patch_log_timing(
+                "AsyncLLMServerManager.generate.release_server",
+                release_timer,
+                prompt_len=len(prompt_ids),
+            )
 
 
 class AgentLoopMetrics(BaseModel):
@@ -461,6 +510,7 @@ class AgentLoopWorker:
                 self.teacher_server_manager = None
         else:
             self.stream_teacher_with_rollout = False
+            self.teacher_server_manager = None
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
@@ -495,6 +545,31 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+        # Reuse agent-loop instances at worker scope so tool backends are not
+        # reinitialized for every sample in the batch.
+        self._agent_loop_instances: dict[str, AgentLoopBase] = {}
+
+    def _get_or_create_agent_loop(self, agent_name: str) -> AgentLoopBase:
+        if agent_name in self._agent_loop_instances:
+            return self._agent_loop_instances[agent_name]
+
+        assert agent_name in _agent_loop_registry, (
+            f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+        )
+
+        agent_loop_config = _agent_loop_registry[agent_name]
+        agent_loop = hydra.utils.instantiate(
+            config=agent_loop_config,
+            trainer_config=DictConfigWrap(config=self.config),
+            server_manager=self.server_manager,
+            teacher_server_manager=self.teacher_server_manager,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            dataset_cls=self.dataset_cls,
+            data_config=DictConfigWrap(self.config.data),
+        )
+        self._agent_loop_instances[agent_name] = agent_loop
+        return agent_loop
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -517,6 +592,7 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        batch_timer = time.perf_counter()
         config = self.rollout_config
         sampling_params = dict(
             temperature=config.temperature,
@@ -562,6 +638,7 @@ class AgentLoopWorker:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        gather_timer = monkey_patch_timing_begin(capture_gpu=True)
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
@@ -572,9 +649,28 @@ class AgentLoopWorker:
                 )
             )
         outputs = await asyncio.gather(*tasks)
+        _monkey_patch_log_timing(
+            "AgentLoopWorker.generate_sequences.gather",
+            gather_timer,
+            batch_size=len(batch),
+            validate=batch.meta_info.get("validate", False),
+        )
 
+        postprocess_timer = monkey_patch_timing_begin(capture_gpu=False)
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+        )
+        _monkey_patch_log_timing(
+            "AgentLoopWorker.generate_sequences.postprocess",
+            postprocess_timer,
+            batch_size=len(outputs),
+            validate=batch.meta_info.get("validate", False),
+        )
+        _monkey_patch_log_timing(
+            "AgentLoopWorker.generate_sequences.total",
+            batch_timer,
+            batch_size=len(batch),
+            validate=batch.meta_info.get("validate", False),
         )
         return output
 
@@ -587,6 +683,7 @@ class AgentLoopWorker:
         trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
+        run_timer = monkey_patch_timing_begin(capture_gpu=True)
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -595,25 +692,40 @@ class AgentLoopWorker:
             name="agent_loop",
             trace=trace,
         ):
-            assert agent_name in _agent_loop_registry, (
-                f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
-            )
-
-            agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
-                trainer_config=DictConfigWrap(config=self.config),
-                server_manager=self.server_manager,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                dataset_cls=self.dataset_cls,
-                data_config=DictConfigWrap(self.config.data),
-            )
+            agent_loop = self._get_or_create_agent_loop(agent_name)
+            agent_timer = monkey_patch_timing_begin(capture_gpu=True)
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            _monkey_patch_log_timing(
+                "AgentLoopWorker._run_agent_loop.agent_loop_run",
+                agent_timer,
+                sample_index=trajectory["sample_index"],
+                validate=trajectory["validate"],
+                response_len=len(output.response_ids),
+                prompt_len=len(output.prompt_ids),
+            )
+            post_timer = monkey_patch_timing_begin(capture_gpu=True)
+            result = await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            _monkey_patch_log_timing(
+                "AgentLoopWorker._run_agent_loop.postprocess",
+                post_timer,
+                sample_index=trajectory["sample_index"],
+                validate=trajectory["validate"],
+                response_len=len(output.response_ids),
+                prompt_len=len(output.prompt_ids),
+            )
+            _monkey_patch_log_timing(
+                "AgentLoopWorker._run_agent_loop.total",
+                run_timer,
+                sample_index=trajectory["sample_index"],
+                validate=trajectory["validate"],
+                response_len=len(output.response_ids),
+                prompt_len=len(output.prompt_ids),
+            )
+            return result
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
+        total_timer = monkey_patch_timing_begin(capture_gpu=True)
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
@@ -637,6 +749,7 @@ class AgentLoopWorker:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
+        prompt_pad_timer = monkey_patch_timing_begin(capture_gpu=False)
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
@@ -648,7 +761,14 @@ class AgentLoopWorker:
         if prompt_output["input_ids"].dim() == 1:
             prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._agent_loop_postprocess.prompt_pad",
+            prompt_pad_timer,
+            prompt_len=len(output.prompt_ids),
+            validate=validate,
+        )
 
+        response_pad_timer = monkey_patch_timing_begin(capture_gpu=False)
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
             {"input_ids": output.response_ids},
@@ -670,6 +790,12 @@ class AgentLoopWorker:
         )
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._agent_loop_postprocess.response_pad",
+            response_pad_timer,
+            response_len=len(output.response_ids),
+            validate=validate,
+        )
 
         response_logprobs = None
         if output.response_logprobs is not None:
@@ -707,8 +833,17 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
+        position_timer = monkey_patch_timing_begin(capture_gpu=False)
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._agent_loop_postprocess.position_and_mm",
+            position_timer,
+            total_seq_len=int(input_ids.shape[1]),
+            validate=validate,
+        )
+
+        reward_timer = monkey_patch_timing_begin(capture_gpu=False)
         await self._compute_score(
             output,
             prompts=prompt_output["input_ids"],
@@ -718,10 +853,24 @@ class AgentLoopWorker:
             position_ids=position_ids,
             kwargs=kwargs,
         )
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._agent_loop_postprocess.reward",
+            reward_timer,
+            total_seq_len=int(input_ids.shape[1]),
+            validate=validate,
+        )
+
+        teacher_timer = monkey_patch_timing_begin(capture_gpu=True)
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
             response_ids=output.response_ids,
+            validate=validate,
+        )
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._agent_loop_postprocess.teacher",
+            teacher_timer,
+            total_seq_len=int(input_ids.shape[1]),
             validate=validate,
         )
         teacher_ids, teacher_logprobs = (
@@ -742,6 +891,12 @@ class AgentLoopWorker:
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._agent_loop_postprocess.total",
+            total_timer,
+            total_seq_len=int(input_ids.shape[1]),
+            validate=validate,
+        )
         return _InternalAgentLoopOutput(
             prompt_ids=prompt_output["input_ids"],
             response_ids=response_output["input_ids"],
@@ -832,6 +987,7 @@ class AgentLoopWorker:
         enable_async_reward = self.reward_loop_worker_handles is not None
 
         if output.reward_score is None and enable_async_reward:
+            total_timer = monkey_patch_timing_begin(capture_gpu=False)
             batch = TensorDict(
                 {
                     "prompts": prompts,  # [1, prompt_length]
@@ -853,19 +1009,82 @@ class AgentLoopWorker:
                 non_tensor_batch=non_tensor_batch,
             )
             selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
+            remote_timer = monkey_patch_timing_begin(capture_gpu=False)
             result = await selected_reward_loop_worker_handle.compute_score.remote(data)
+            _monkey_patch_log_timing(
+                "AgentLoopWorker._compute_score.remote_wait",
+                remote_timer,
+                total_seq_len=int(input_ids.shape[1]),
+                num_turns=output.num_turns,
+            )
             output.reward_score = result["reward_score"]
             output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+            _monkey_patch_log_timing(
+                "AgentLoopWorker._compute_score.total",
+                total_timer,
+                total_seq_len=int(input_ids.shape[1]),
+                num_turns=output.num_turns,
+            )
 
     async def _compute_teacher_logprobs(self, output: AgentLoopOutput, prompt_ids, response_ids, validate):
         """Compute teacher logprobs for single sample."""
+        # SKD: teacher targets were already accumulated during chunk generation.
+        # teacher_ids_list / teacher_logprobs_list are response-token aligned:
+        # row i supervises response token i.
+        #
+        # The standard teacher path stores full-sequence rows in "next-token" layout,
+        # and downstream no_padding_2_padding() slices responses with a one-token
+        # left shift. To match that contract here, rebuild:
+        #   [prompt_dummy x (prompt_len - 1)] + [response rows] + [final dummy]
+        # so the left-shift slice returns exactly the response-aligned rows.
+        if "teacher_ids_list" in output.extra_fields:
+            import torch
+
+            teacher_ids_list = output.extra_fields.pop("teacher_ids_list")
+            teacher_logprobs_list = output.extra_fields.pop("teacher_logprobs_list")
+            if teacher_ids_list:
+                K = len(teacher_ids_list[0])
+                prompt_len = len(prompt_ids)
+                response_len = len(response_ids)
+                skd_len = len(teacher_ids_list)
+                assert prompt_len > 0, "SKD teacher reconstruction requires prompt_len > 0"
+                # SKD may accumulate more tokens than response_ids if multi-turn.
+                # Truncate to match response_ids length (same as ToolAgentLoop's truncation).
+                teacher_ids_list = teacher_ids_list[:response_len]
+                teacher_logprobs_list = teacher_logprobs_list[:response_len]
+                # If SKD accumulated fewer tokens (e.g., EOS early), pad to response_len
+                while len(teacher_ids_list) < response_len:
+                    teacher_ids_list.append([0] * K)
+                    teacher_logprobs_list.append([0.0] * K)
+                prompt_dummy_ids = [[0] * K] * (prompt_len - 1)
+                prompt_dummy_logprobs = [[0.0] * K] * (prompt_len - 1)
+                final_dummy_ids = [[0] * K]
+                final_dummy_logprobs = [[0.0] * K]
+                full_ids = prompt_dummy_ids + teacher_ids_list + final_dummy_ids
+                full_logprobs = prompt_dummy_logprobs + teacher_logprobs_list + final_dummy_logprobs
+                expected_len = prompt_len + response_len
+                assert len(full_ids) == expected_len, (
+                    f"[SKD] teacher_ids length mismatch: {len(full_ids)} != {expected_len} "
+                    f"(prompt={prompt_len}, response={response_len}, skd_accumulated={skd_len})"
+                )
+                output.extra_fields["teacher_ids"] = torch.tensor(full_ids, dtype=torch.int32)
+                output.extra_fields["teacher_logprobs"] = torch.tensor(full_logprobs)
+            return
+
         if self.stream_teacher_with_rollout and not validate:
+            total_timer = monkey_patch_timing_begin(capture_gpu=True)
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+            _monkey_patch_log_timing(
+                "AgentLoopWorker._compute_teacher_logprobs.total",
+                total_timer,
+                seq_len=len(prompt_ids) + len(response_ids),
+                validate=validate,
+            )
 
     def _postprocess(
         self,
@@ -874,6 +1093,7 @@ class AgentLoopWorker:
         validate: bool = False,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        total_timer = monkey_patch_timing_begin(capture_gpu=False)
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
@@ -960,6 +1180,12 @@ class AgentLoopWorker:
         else:
             meta_info = {"metrics": metrics}
 
+        _monkey_patch_log_timing(
+            "AgentLoopWorker._postprocess.total",
+            total_timer,
+            batch_size=len(inputs),
+            validate=validate,
+        )
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,

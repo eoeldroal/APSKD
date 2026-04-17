@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -24,8 +27,29 @@ from torch.nn import functional as F
 from verl.experimental.agent_loop import AsyncLLMServerManager
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.monkey_patch_timing import monkey_patch_log_timing, monkey_patch_timing_begin
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import DistillationConfig, DistillationLossConfig
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+# MONKEY PATCH: timing instrumentation toggles for teacher scoring hotspot analysis.
+_MONKEY_PATCH_TIMING_ENABLED = os.getenv("VERL_MONKEY_PATCH_TIMING", "0") == "1"
+_MONKEY_PATCH_TIMING_SLOW_MS = float(os.getenv("VERL_MONKEY_PATCH_TIMING_SLOW_MS", "50"))
+
+
+def _monkey_patch_log_timing(name: str, start_time: float, **extra: Any) -> None:
+    """MONKEY PATCH: emit searchable timing logs for slow teacher substeps."""
+    monkey_patch_log_timing(
+        logger,
+        name,
+        start_time,
+        enabled=_MONKEY_PATCH_TIMING_ENABLED,
+        slow_ms=_MONKEY_PATCH_TIMING_SLOW_MS,
+        **extra,
+    )
 
 
 def _get_teacher_sampling_params(
@@ -34,14 +58,26 @@ def _get_teacher_sampling_params(
 ) -> dict[str, Any]:
     """Get sampling parameters for teacher model when computing log probabilities for distillation."""
     if distillation_config.teacher_model.inference.temperature != 1.0:
-        raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
+        raise NotImplementedError("Temperature != 1.0 is not supported for teacher prompt_logprobs.")
 
     num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
-    return {
-        "max_tokens": 1,
-        "temperature": distillation_config.teacher_model.inference.temperature,
-        "prompt_logprobs": num_logprobs,
-    }
+    engine_name = distillation_config.teacher_model.inference.name
+
+    if engine_name == "sglang":
+        # SGLang uses return_logprob + top_logprobs_num at request level.
+        # "prompt_logprobs" key signals async_sglang_server to enable input logprobs mode.
+        return {
+            "max_tokens": 1,
+            "temperature": distillation_config.teacher_model.inference.temperature,
+            "prompt_logprobs": num_logprobs,  # async_sglang_server will interpret this
+        }
+    else:
+        # vLLM: prompt_logprobs is a native SamplingParams field
+        return {
+            "max_tokens": 1,
+            "temperature": distillation_config.teacher_model.inference.temperature,
+            "prompt_logprobs": num_logprobs,
+        }
 
 
 def _pad_teacher_outputs(
@@ -107,26 +143,54 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],
+        request_id: Optional[str] = None,
+        logprob_start_len: int = 0,
         multi_modal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
+        total_timer = monkey_patch_timing_begin(capture_gpu=True)
         multi_modal_data = multi_modal_data or {}
+        generate_timer = monkey_patch_timing_begin(capture_gpu=True)
+        sampling_params = _get_teacher_sampling_params(self.distillation_config, self.distillation_loss_config)
+        if self.distillation_config.teacher_model.inference.name == "sglang":
+            sampling_params["prompt_logprobs_start_len"] = logprob_start_len
         teacher_output = await self.generate(
-            request_id=uuid4().hex,
+            request_id=request_id or uuid4().hex,
             prompt_ids=sequence_ids,
-            sampling_params=_get_teacher_sampling_params(self.distillation_config, self.distillation_loss_config),
+            sampling_params=sampling_params,
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
+        )
+        _monkey_patch_log_timing(
+            "AsyncTeacherLLMServerManager.compute_teacher_logprobs_single.generate",
+            generate_timer,
+            seq_len=len(sequence_ids),
+            has_images=bool(multi_modal_data.get("images")),
+            has_videos=bool(multi_modal_data.get("videos")),
         )
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+        expected_len = len(sequence_ids)
+        if self.distillation_config.teacher_model.inference.name == "sglang" and logprob_start_len > 0:
+            expected_len = len(sequence_ids) - logprob_start_len - 1
+        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == expected_len, (
+            f"Unexpected teacher logprob length: ids={teacher_ids.shape[0]}, "
+            f"logprobs={teacher_logprobs.shape[0]}, expected={expected_len}, "
+            f"seq_len={len(sequence_ids)}, start={logprob_start_len}"
+        )
+        _monkey_patch_log_timing(
+            "AsyncTeacherLLMServerManager.compute_teacher_logprobs_single.total",
+            total_timer,
+            seq_len=len(sequence_ids),
+            topk=teacher_logprobs.shape[-1] if teacher_logprobs.ndim > 1 else 1,
+        )
         return teacher_ids, teacher_logprobs
 
     async def compute_teacher_logprobs_batch(self, data: DataProto) -> DataProto:
         """Compute teacher log probabilities for a batch of prompt-response pairs."""
+        total_timer = monkey_patch_timing_begin(capture_gpu=True)
         multi_modal_data_batch = data.non_tensor_batch.get("teacher_multi_modal_data")
         tasks = []
         lengths = []
@@ -147,7 +211,13 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
                     )
                 )
             )
+        gather_timer = monkey_patch_timing_begin(capture_gpu=True)
         outputs = await asyncio.gather(*tasks)
+        _monkey_patch_log_timing(
+            "AsyncTeacherLLMServerManager.compute_teacher_logprobs_batch.gather",
+            gather_timer,
+            batch_size=len(tasks),
+        )
 
         # Pad the teacher logprobs and ids
         padded_teacher_ids = []
@@ -171,5 +241,12 @@ class AsyncTeacherLLMServerManager(AsyncLLMServerManager):
                 "teacher_logprobs": torch.cat(padded_teacher_logprobs),
             },
             batch_size=len(data),
+        )
+        _monkey_patch_log_timing(
+            "AsyncTeacherLLMServerManager.compute_teacher_logprobs_batch.total",
+            total_timer,
+            batch_size=len(data),
+            prompt_width=prompt_width,
+            response_width=response_width,
         )
         return DataProto(batch=batch)

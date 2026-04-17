@@ -393,15 +393,25 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        # Teacher distillation mode: prompt_logprobs requests input token logprobs
+        # (analogous to vLLM's prompt_logprobs parameter).
+        num_prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+        prompt_logprobs_start_len = sampling_params.pop("prompt_logprobs_start_len", None)
+
         request = {
             "rid": request_id,
             "input_ids": prompt_ids,
             "sampling_params": sampling_params,
-            "return_logprob": return_logprob,
+            "return_logprob": return_logprob or (num_prompt_logprobs is not None),
             "image_data": image_data,
             # TODO: support video input for sglang
             # video_data=video_data,
         }
+
+        # Enable input token logprobs for teacher distillation
+        if num_prompt_logprobs is not None:
+            request["logprob_start_len"] = prompt_logprobs_start_len or 0
+            request["top_logprobs_num"] = num_prompt_logprobs  # top-K at each position
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -415,7 +425,7 @@ class SGLangHttpServer:
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
         finish_reason = output["meta_info"]["finish_reason"]
         finish_reason = finish_reason["type"] if finish_reason else None
-        if return_logprob:
+        if return_logprob and num_prompt_logprobs is None:
             output_token_logprobs = output["meta_info"]["output_token_logprobs"]
             log_probs, token_ids = zip(
                 *[(log_prob, token_ids) for log_prob, token_ids, _ in output_token_logprobs], strict=True
@@ -442,12 +452,48 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
+        extra_fields = {"global_steps": self.global_steps}
+
+        # Extract input token logprobs for teacher distillation (prompt_logprobs mode).
+        # Converts SGLang's input_top_logprobs format to vLLM's extract_prompt_logprobs format
+        # so that compute_teacher_logprobs_single() can consume it identically.
+        if num_prompt_logprobs is not None and num_prompt_logprobs > 0:
+            input_top_logprobs = output["meta_info"].get("input_top_logprobs", [])
+            seq_len = len(prompt_ids)
+            prompt_ids_ls = []
+            prompt_logprobs_ls = []
+            delta_mode = prompt_logprobs_start_len is not None and prompt_logprobs_start_len > 0
+
+            # SGLang returns a leading None placeholder for the first queried position.
+            # In full-sequence mode, keep the historical vLLM-compatible contract:
+            #   skip the None entry and append one final dummy row.
+            # In delta mode (logprob_start_len > 0), SKD only needs the usable rows for
+            # the requested suffix, so skip the leading None and return the remaining rows
+            # without appending a final dummy.
+            for entry in input_top_logprobs:
+                if entry is None:
+                    continue
+                ids = [token_id for _logprob, token_id, _text in entry]
+                lps = [_logprob for _logprob, _token_id, _text in entry]
+                prompt_ids_ls.append(ids)
+                prompt_logprobs_ls.append(lps)
+
+            if not delta_mode:
+                # Pad with dummy to match seq_len (vLLM convention: last entry is dummy)
+                K = num_prompt_logprobs
+                while len(prompt_ids_ls) < seq_len:
+                    prompt_ids_ls.append([0] * K)
+                    prompt_logprobs_ls.append([0.0] * K)
+
+            extra_fields["prompt_ids"] = prompt_ids_ls
+            extra_fields["prompt_logprobs"] = prompt_logprobs_ls
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields=extra_fields,
         )
 
     async def set_global_steps(self, global_steps: int):

@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import time
 
 import aiohttp
 import numpy as np
@@ -36,6 +37,25 @@ from .reward_model import RewardModelManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+# MONKEY PATCH: timing instrumentation toggles for reward hotspot analysis.
+_MONKEY_PATCH_TIMING_ENABLED = os.getenv("VERL_MONKEY_PATCH_TIMING", "0") == "1"
+_MONKEY_PATCH_TIMING_SLOW_MS = float(os.getenv("VERL_MONKEY_PATCH_TIMING_SLOW_MS", "50"))
+
+
+def _monkey_patch_log_timing(name: str, start_time: float, **extra) -> None:
+    """MONKEY PATCH: emit searchable timing logs for slow reward substeps."""
+    if not _MONKEY_PATCH_TIMING_ENABLED:
+        return
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    if elapsed_ms < _MONKEY_PATCH_TIMING_SLOW_MS:
+        return
+    extra_str = ", ".join(f"{k}={v}" for k, v in extra.items())
+    if extra_str:
+        logger.warning("MONKEY PATCH timing %s: %.2f ms (%s)", name, elapsed_ms, extra_str)
+    else:
+        logger.warning("MONKEY PATCH timing %s: %.2f ms", name, elapsed_ms)
 
 
 def migrate_legacy_reward_impl(config):
@@ -138,24 +158,49 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        total_timer = time.perf_counter()
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
         outputs = await asyncio.gather(*tasks)
+        _monkey_patch_log_timing(
+            "RewardLoopWorker.compute_score_batch.total",
+            total_timer,
+            batch_size=len(data),
+        )
         return outputs
 
     async def compute_score(self, data: DataProto) -> dict:
+        total_timer = time.perf_counter()
         assert len(data) == 1, "RewardLoopWorker only support single data item"
         if self.config.reward.custom_reward_function.path is not None:
             # directly use user-customized reward function
-            return await self.reward_manager.run_single(data)
+            result = await self.reward_manager.run_single(data)
+            _monkey_patch_log_timing(
+                "RewardLoopWorker.compute_score.custom_reward",
+                total_timer,
+                data_source=data.non_tensor_batch.get("data_source", ["unknown"])[0],
+            )
+            return result
         else:
             if self.config.reward.reward_model.enable:
                 # we assume the rm is disrm
                 # genrm must set custom_reward_function
-                return await self.compute_score_disrm(data)
+                result = await self.compute_score_disrm(data)
+                _monkey_patch_log_timing(
+                    "RewardLoopWorker.compute_score.disrm",
+                    total_timer,
+                    data_source=data.non_tensor_batch.get("data_source", ["unknown"])[0],
+                )
+                return result
             else:
-                return await self.reward_manager.run_single(data)
+                result = await self.reward_manager.run_single(data)
+                _monkey_patch_log_timing(
+                    "RewardLoopWorker.compute_score.default",
+                    total_timer,
+                    data_source=data.non_tensor_batch.get("data_source", ["unknown"])[0],
+                )
+                return result
 
     async def _post_request(self, payload: dict, endpoint: str, max_retries: int = 16):
         url = f"http://{self.reward_router_address}/{endpoint}"

@@ -25,13 +25,20 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def update_prometheus_config(config: PrometheusConfig, server_addresses: list[str], rollout_name: str | None = None):
+def update_prometheus_config(
+    config: PrometheusConfig,
+    server_addresses: list[str],
+    rollout_name: str | None = None,
+    job_name: str = "rollout",
+):
     """
     Update Prometheus configuration file with server addresses and reload on first node.
 
     server_addresses: vllm or sglang server addresses
 
     rollout_name: name of the rollout backend (e.g., "vllm", "sglang")
+
+    job_name: scrape job name to upsert in the Prometheus config
     """
 
     if not server_addresses:
@@ -39,17 +46,31 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
         return
 
     try:
-        # Get Prometheus config file path from environment or use default
-        prometheus_config_json = {
-            "global": {"scrape_interval": "10s", "evaluation_interval": "10s"},
-            "scrape_configs": [
+        if os.path.exists(config.file):
+            with open(config.file) as f:
+                prometheus_config_json = yaml.safe_load(f) or {}
+        else:
+            prometheus_config_json = {}
+
+        prometheus_config_json.setdefault("global", {"scrape_interval": "10s", "evaluation_interval": "10s"})
+        scrape_configs = prometheus_config_json.setdefault("scrape_configs", [])
+
+        if not any(job.get("job_name") == "ray" for job in scrape_configs):
+            scrape_configs.insert(
+                0,
                 {
                     "job_name": "ray",
                     "file_sd_configs": [{"files": ["/tmp/ray/prom_metrics_service_discovery.json"]}],
                 },
-                {"job_name": "rollout", "static_configs": [{"targets": server_addresses}]},
-            ],
-        }
+            )
+
+        static_job = {"job_name": job_name, "static_configs": [{"targets": server_addresses}]}
+        for i, job in enumerate(scrape_configs):
+            if job.get("job_name") == job_name:
+                scrape_configs[i] = static_job
+                break
+        else:
+            scrape_configs.append(static_job)
 
         # Write configuration file to all nodes
         @ray.remote(num_cpus=0)
@@ -92,8 +113,11 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
 
         ray.get(write_tasks)
 
-        server_type = rollout_name.upper() if rollout_name else "rollout"
-        print(f"Updated Prometheus configuration at {config.file} with {len(server_addresses)} {server_type} servers")
+        server_type = rollout_name.upper() if rollout_name else job_name
+        print(
+            f"Updated Prometheus configuration at {config.file} with {len(server_addresses)} "
+            f"{server_type} servers for job {job_name}"
+        )
 
         # Reload Prometheus on all nodes
         reload_tasks = []

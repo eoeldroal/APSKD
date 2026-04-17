@@ -63,11 +63,23 @@ def compute_forward_kl_topk(
     assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
 
     # 2. compute token-wise KL divergence across sp groups
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+    loss_config: DistillationLossConfig = config.distillation_loss
+    if getattr(loss_config, "memory_efficient", False):
+        # Memory-efficient path: avoid materializing (T, vocab_size) tensor.
+        # log_softmax(x)[i] = x[i] - logsumexp(x), so we compute logsumexp as a
+        # scalar per token and gather only the topk logits.
+        # Disable autocast to prevent fp32 promotion: logsumexp internally computes
+        # exp(x - max) which is (T, vocab_size). Under autocast this becomes fp32,
+        # doubling the memory. With autocast disabled, it stays bf16.
+        with torch.amp.autocast('cuda', enabled=False):
+            lse = torch.logsumexp(student_logits, dim=-1, keepdim=True)  # (1, T, 1)
+        student_topk_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_ids)  # (1, T, topk)
+        student_topk_log_probs = student_topk_logits - lse  # (1, T, topk)
+    else:
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
-    loss_config: DistillationLossConfig = config.distillation_loss
     if loss_config.log_prob_min_clamp is not None:
         student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)

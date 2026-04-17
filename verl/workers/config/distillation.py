@@ -21,10 +21,12 @@ from verl.base_config import BaseConfig
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "SkdConfig", "DistillationConfig"]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET = 512
 
 
 @dataclass
@@ -63,6 +65,7 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode: str = "k3"
     topk: Optional[int] = 128
+    memory_efficient: bool = False
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
@@ -137,6 +140,27 @@ class DistillationTeacherModelConfig(BaseConfig):
 
 
 @dataclass
+class SkdConfig(BaseConfig):
+    """Configuration for Speculative Knowledge Distillation (SKD).
+
+    chunk_size (int):
+        Number of tokens Student generates per chunk before Teacher verification.
+    verify_top_k (int):
+        Teacher's top-K used for accept/reject verification.
+    max_chunks_per_sample (int):
+        Maximum number of SKD chunks per sample to prevent stragglers.
+    teacher_system_prompt_path (str, optional):
+        Optional path to a teacher-only system prompt file used to build a
+        separate teacher verification prefix in SKD.
+    """
+
+    chunk_size: int = 1024
+    verify_top_k: int = 25
+    max_chunks_per_sample: int = 60
+    teacher_system_prompt_path: Optional[str] = None
+
+
+@dataclass
 class DistillationConfig(BaseConfig):
     """Configuration for on-policy distillation.
 
@@ -148,6 +172,8 @@ class DistillationConfig(BaseConfig):
         Configuration for the teacher model used for distillation.
     distillation_loss (DistillationLossConfig):
         Configuration for distillation loss settings.
+    skd (SkdConfig):
+        Configuration for Speculative Knowledge Distillation.
     """
 
     _mutable_fields = BaseConfig._mutable_fields
@@ -156,6 +182,7 @@ class DistillationConfig(BaseConfig):
     num_workers: int = 8
     teacher_model: DistillationTeacherModelConfig = field(default_factory=DistillationTeacherModelConfig)
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    skd: SkdConfig = field(default_factory=SkdConfig)
 
     def __post_init__(self):
         # Prompt + Response from student are fed into teacher as context
@@ -163,24 +190,45 @@ class DistillationConfig(BaseConfig):
         max_num_batched_tokens = self.teacher_model.inference.max_num_batched_tokens
         student_prompt_length = self.teacher_model.inference.prompt_length
         student_response_length = self.teacher_model.inference.response_length
+        teacher_system_prompt_path = self.skd.get("teacher_system_prompt_path", None) if self.skd else None
+        teacher_extra_prompt_budget = _TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET if teacher_system_prompt_path else 0
+
+        if max_model_len is not None:
+            object.__setattr__(
+                self.teacher_model.inference,
+                "max_model_len",
+                max_model_len + teacher_extra_prompt_budget,
+            )
+            max_model_len = self.teacher_model.inference.max_model_len
+        if max_num_batched_tokens is not None:
+            object.__setattr__(
+                self.teacher_model.inference,
+                "max_num_batched_tokens",
+                max_num_batched_tokens + teacher_extra_prompt_budget,
+            )
+            max_num_batched_tokens = self.teacher_model.inference.max_num_batched_tokens
+
         if self.enabled:
-            required_context_len = student_prompt_length + student_response_length + 1
+            required_context_len = student_prompt_length + student_response_length + 1 + teacher_extra_prompt_budget
             if max_model_len is not None and required_context_len > max_model_len:
                 raise ValueError(
                     "Distillation teacher inference requires room for the student prompt, the full student "
-                    f"response, and one generated token, but got {student_prompt_length=}, "
-                    f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
+                    f"response, one generated token, and any configured teacher-only prefix budget, but got "
+                    f"{student_prompt_length=}, {student_response_length=}, "
+                    f"{teacher_extra_prompt_budget=}, {required_context_len=}, {max_model_len=}."
                 )
             if max_num_batched_tokens is not None and required_context_len > max_num_batched_tokens:
                 raise ValueError(
                     "Distillation teacher inference requires room for the student prompt, the full student "
-                    f"response, and one generated token within the engine batching budget, but got "
-                    f"{student_prompt_length=}, {student_response_length=}, {required_context_len=}, "
-                    f"{max_num_batched_tokens=}."
+                    f"response, one generated token, and any configured teacher-only prefix budget within the "
+                    f"engine batching budget, but got {student_prompt_length=}, {student_response_length=}, "
+                    f"{teacher_extra_prompt_budget=}, {required_context_len=}, {max_num_batched_tokens=}."
                 )
 
         self.teacher_model.inference.prompt_length = (
-            self.teacher_model.inference.prompt_length + self.teacher_model.inference.response_length
+            self.teacher_model.inference.prompt_length
+            + self.teacher_model.inference.response_length
+            + teacher_extra_prompt_budget
         )
         self.teacher_model.inference.response_length = 1
 
@@ -202,6 +250,10 @@ class DistillationConfig(BaseConfig):
                         f"({self.distillation_loss.topk}) to enable distillation loss computation."
                     )
                 engine_kwargs["vllm"] = vllm_engine_kwargs
+            case "sglang":
+                # SGLang uses top_logprobs_num parameter (set at request time, not engine level).
+                # No engine_kwargs validation needed — just ensure the config is valid.
+                pass
             case _:
                 raise NotImplementedError(
                     f"DistillationTeacherModelConfig does not support inference engine {engine_name}"

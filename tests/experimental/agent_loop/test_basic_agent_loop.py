@@ -24,6 +24,7 @@ from transformers.utils import get_json_schema
 from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.agent_loop.agent_loop import GlobalRequestLoadBalancer, get_trajectory_info
+from verl.experimental.agent_loop.agent_loop import register
 from verl.protocol import DataProto
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema
 from verl.tools.schemas import ToolResponse
@@ -187,6 +188,41 @@ class WeatherToolWithData(BaseTool):
             return ToolResponse(text=json.dumps(result)), 0, {}
         except Exception as e:
             return ToolResponse(text=str(e)), 0, {}
+
+
+@register("test_cache_agent")
+class CachedTestAgent:
+    def __init__(self, *args, **kwargs):
+        pass
+
+
+def test_agent_loop_worker_reuses_agent_loop_instances(monkeypatch):
+    from types import SimpleNamespace
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+
+    instantiate_calls = []
+
+    def fake_instantiate(**kwargs):
+        instantiate_calls.append(kwargs["config"])
+        return SimpleNamespace(name=kwargs["config"]["_target_"])
+
+    worker = AgentLoopWorker.__new__(AgentLoopWorker)
+    worker.config = SimpleNamespace(data={})
+    worker.server_manager = object()
+    worker.teacher_server_manager = None
+    worker.tokenizer = object()
+    worker.processor = None
+    worker.dataset_cls = object()
+    worker._agent_loop_instances = {}
+
+    monkeypatch.setattr("hydra.utils.instantiate", fake_instantiate)
+
+    first = worker._get_or_create_agent_loop("test_cache_agent")
+    second = worker._get_or_create_agent_loop("test_cache_agent")
+
+    assert first is second
+    assert len(instantiate_calls) == 1
 
 
 def test_tool_agent(init_config):

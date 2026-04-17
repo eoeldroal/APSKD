@@ -98,3 +98,10 @@ teacher_model:
     prompt_length: ${oc.select:actor_rollout_ref.rollout.prompt_length}
     response_length: ${oc.select:actor_rollout_ref.rollout.response_length}
     temperature: ${oc.select:actor_rollout_ref.rollout.temperature}
+
+# SKD (Speculative Knowledge Distillation) config
+skd:
+  chunk_size: 1024
+  verify_top_k: 25
+  max_chunks_per_sample: 60
+  teacher_system_prompt_path: null

@@ -130,3 +130,18 @@ logs
 log
 outputs
 .history
+*.out
+
+# local experiment artifacts
+/data/
+/data-log/
+/docs/superpowers/
+
+# local binary/vendor artifacts
+*.whl
+/=0.5.7
+
+# local reference/rendered documents
+/examples/on_policy_distillation_trainer/document/references/*.pdf
+/examples/on_policy_distillation_trainer/document/presentation/*.pdf
+/examples/on_policy_distillation_trainer/document/presentation/index.html

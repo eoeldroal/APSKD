@@ -3,7 +3,7 @@
 USE_MEGATRON=${USE_MEGATRON:-1}
 USE_SGLANG=${USE_SGLANG:-1}
 
-export MAX_JOBS=32
+export MAX_JOBS=48
 
 echo "1. install inference frameworks and pytorch they need"
 if [ $USE_SGLANG -eq 1 ]; then

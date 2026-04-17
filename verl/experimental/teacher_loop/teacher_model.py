@@ -99,6 +99,22 @@ class TeacherModelManager:
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
+        prometheus_config = teacher_model_config.inference.prometheus
+        if prometheus_config.enable:
+            if teacher_model_config.inference.disable_log_stats:
+                raise ValueError(
+                    "Teacher PROMETHEUS needs disable_log_stats==False, "
+                    "but distillation.teacher_model.inference.disable_log_stats is currently True."
+                )
+            from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
+
+            update_prometheus_config(
+                prometheus_config,
+                self.server_addresses,
+                rollout_name=teacher_model_config.inference.name,
+                job_name="teacher",
+            )
+
     def _initialize_async_server_manager(self):
         from verl.experimental.agent_loop.agent_loop import GlobalRequestLoadBalancer
         from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager

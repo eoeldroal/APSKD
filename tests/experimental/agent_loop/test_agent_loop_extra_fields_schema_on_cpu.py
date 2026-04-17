@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from typing import Any, Optional
 
@@ -29,7 +30,10 @@ from verl.experimental.agent_loop.agent_loop import (
     DictConfigWrap,
     _InternalAgentLoopOutput,
 )
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.protocol import DataProto
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.rollout.replica import TokenOutput
 
@@ -119,6 +123,12 @@ def _pad_1d(ids: list[int], *, length: int, pad_id: int = 0) -> list[int]:
     if len(ids) > length:
         return ids[:length]
     return ids + [pad_id] * (length - len(ids))
+
+
+def _object_array(values: list[Any]) -> np.ndarray:
+    array = np.empty(len(values), dtype=object)
+    array[:] = values
+    return array
 
 
 def _to_internal(
@@ -300,3 +310,268 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+def test_skd_teacher_reconstruction_matches_standard_left_shift_contract():
+    class _DummyWorker:
+        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+        stream_teacher_with_rollout = False
+
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102, 103],
+        response_ids=[11, 12],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "teacher_ids_list": [[111, 112], [221, 222]],
+            "teacher_logprobs_list": [[-1.0, -2.0], [-3.0, -4.0]],
+        },
+    )
+
+    asyncio.run(
+        AgentLoopWorker._compute_teacher_logprobs(
+            _DummyWorker(),
+            output,
+            prompt_ids=output.prompt_ids,
+            response_ids=output.response_ids,
+            validate=False,
+        )
+    )
+
+    teacher_ids = output.extra_fields["teacher_ids"]
+    teacher_logprobs = output.extra_fields["teacher_logprobs"]
+
+    assert teacher_ids.tolist() == [
+        [0, 0],
+        [0, 0],
+        [111, 112],
+        [221, 222],
+        [0, 0],
+    ]
+    assert teacher_logprobs.tolist() == [
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [-1.0, -2.0],
+        [-3.0, -4.0],
+        [0.0, 0.0],
+    ]
+
+    prompt_len = len(output.prompt_ids)
+    response_len = len(output.response_ids)
+    response_slice = teacher_ids[prompt_len - 1 : prompt_len + response_len - 1]
+    response_logprob_slice = teacher_logprobs[prompt_len - 1 : prompt_len + response_len - 1]
+    assert response_slice.tolist() == [[111, 112], [221, 222]]
+    assert response_logprob_slice.tolist() == [[-1.0, -2.0], [-3.0, -4.0]]
+
+
+def test_skd_teacher_reconstruction_preserves_dummy_rows_for_tool_spans():
+    class _DummyWorker:
+        _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
+        stream_teacher_with_rollout = False
+
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102, 103],
+        response_ids=[11, 12, 90, 91, 13],
+        response_mask=[1, 1, 0, 0, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "teacher_ids_list": [[111, 112], [221, 222], [0, 0], [0, 0], [331, 332]],
+            "teacher_logprobs_list": [[-1.0, -2.0], [-3.0, -4.0], [0.0, 0.0], [0.0, 0.0], [-5.0, -6.0]],
+        },
+    )
+
+    asyncio.run(
+        AgentLoopWorker._compute_teacher_logprobs(
+            _DummyWorker(),
+            output,
+            prompt_ids=output.prompt_ids,
+            response_ids=output.response_ids,
+            validate=False,
+        )
+    )
+
+    prompt_len = len(output.prompt_ids)
+    response_len = len(output.response_ids)
+    response_slice = output.extra_fields["teacher_ids"][prompt_len - 1 : prompt_len + response_len - 1]
+    response_logprob_slice = output.extra_fields["teacher_logprobs"][prompt_len - 1 : prompt_len + response_len - 1]
+    assert response_slice.tolist() == [[111, 112], [221, 222], [0, 0], [0, 0], [331, 332]]
+    assert response_logprob_slice.tolist() == [[-1.0, -2.0], [-3.0, -4.0], [0.0, 0.0], [0.0, 0.0], [-5.0, -6.0]]
+
+
+def test_skd_processing_tools_appends_dummy_teacher_rows(monkeypatch):
+    async def _fake_processing(self, agent_data):
+        del self
+        agent_data.prompt_ids += [71, 72]
+        agent_data.response_mask += [0, 0]
+        return AgentState.GENERATING
+
+    monkeypatch.setattr(ToolAgentLoop, "_handle_processing_tools_state", _fake_processing)
+
+    loop = SkdAgentLoop.__new__(SkdAgentLoop)
+    loop.loss_top_k = 3
+    agent_data = AgentData(
+        messages=[],
+        image_data=None,
+        video_data=None,
+        metrics={},
+        request_id="req-tools",
+        tools_kwargs={},
+    )
+    agent_data.response_mask = [1]
+    agent_data.prompt_ids = [41]
+    agent_data.extra_fields["teacher_prompt_ids"] = [91]
+    agent_data.extra_fields["teacher_ids_list"] = [[11, 12, 13]]
+    agent_data.extra_fields["teacher_logprobs_list"] = [[-1.0, -2.0, -3.0]]
+
+    next_state = asyncio.run(SkdAgentLoop._handle_processing_tools_state(loop, agent_data))
+
+    assert next_state == AgentState.GENERATING
+    assert agent_data.response_mask == [1, 0, 0]
+    assert agent_data.prompt_ids == [41, 71, 72]
+    assert agent_data.extra_fields["teacher_prompt_ids"] == [91, 71, 72]
+    assert agent_data.extra_fields["teacher_ids_list"] == [[11, 12, 13], [0, 0, 0], [0, 0, 0]]
+    assert agent_data.extra_fields["teacher_logprobs_list"] == [
+        [-1.0, -2.0, -3.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+    ]
+
+
+def test_skd_interaction_appends_dummy_teacher_rows(monkeypatch):
+    async def _fake_interacting(self, agent_data):
+        del self
+        agent_data.prompt_ids += [81, 82, 83]
+        agent_data.response_mask += [0, 0, 0]
+        return AgentState.TERMINATED
+
+    monkeypatch.setattr(ToolAgentLoop, "_handle_interacting_state", _fake_interacting)
+
+    loop = SkdAgentLoop.__new__(SkdAgentLoop)
+    loop.loss_top_k = 2
+    agent_data = AgentData(
+        messages=[],
+        image_data=None,
+        video_data=None,
+        metrics={},
+        request_id="req-interaction",
+        tools_kwargs={},
+    )
+    agent_data.response_mask = [1, 1]
+    agent_data.prompt_ids = [51, 52]
+    agent_data.extra_fields["teacher_prompt_ids"] = [151, 152]
+    agent_data.extra_fields["teacher_ids_list"] = [[10, 11], [20, 21]]
+    agent_data.extra_fields["teacher_logprobs_list"] = [[-1.0, -1.1], [-2.0, -2.1]]
+
+    next_state = asyncio.run(SkdAgentLoop._handle_interacting_state(loop, agent_data))
+
+    assert next_state == AgentState.TERMINATED
+    assert agent_data.response_mask == [1, 1, 0, 0, 0]
+    assert agent_data.prompt_ids == [51, 52, 81, 82, 83]
+    assert agent_data.extra_fields["teacher_prompt_ids"] == [151, 152, 81, 82, 83]
+    assert agent_data.extra_fields["teacher_ids_list"] == [[10, 11], [20, 21], [0, 0], [0, 0], [0, 0]]
+    assert agent_data.extra_fields["teacher_logprobs_list"] == [
+        [-1.0, -1.1],
+        [-2.0, -2.1],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+    ]
+
+
+def test_skd_pending_initializes_teacher_prompt_stream():
+    captured_system_contents = []
+
+    async def _fake_apply_chat_template(messages, tools=None, images=None, videos=None):
+        del tools, images, videos
+        first_message = messages[0] if messages else {}
+        if first_message.get("role") == "system":
+            captured_system_contents.append(first_message.get("content"))
+        return [10 * len(captured_system_contents)]
+
+    loop = SkdAgentLoop.__new__(SkdAgentLoop)
+    loop.tool_schemas = []
+    loop.teacher_system_prompt = "Teacher-only note."
+    loop.apply_chat_template = _fake_apply_chat_template
+
+    agent_data = AgentData(
+        messages=[
+            {"role": "system", "content": "Student system."},
+            {"role": "user", "content": "Question"},
+        ],
+        image_data=None,
+        video_data=None,
+        metrics={},
+        request_id="req-pending",
+        tools_kwargs={},
+    )
+
+    next_state = asyncio.run(SkdAgentLoop._handle_pending_state(loop, agent_data, {}))
+
+    assert next_state == AgentState.GENERATING
+    assert agent_data.prompt_ids == [10]
+    assert agent_data.extra_fields["teacher_prompt_ids"] == [20]
+    assert captured_system_contents == [
+        "Student system.",
+        "Student system.\n\nTeacher-only note.",
+    ]
+
+
+def test_skd_generate_uses_teacher_prompt_stream():
+    class _FakeServerManager:
+        async def generate(self, request_id, prompt_ids, sampling_params, image_data=None, video_data=None):
+            del request_id, prompt_ids, sampling_params, image_data, video_data
+            return TokenOutput(token_ids=[42], num_preempted=0, extra_fields={})
+
+    class _FakeTeacherManager:
+        def __init__(self):
+            self.sequence_ids = None
+            self.logprob_start_len = None
+
+        async def compute_teacher_logprobs_single(
+            self, sequence_ids, request_id=None, logprob_start_len=0, multi_modal_data=None
+        ):
+            del request_id, multi_modal_data
+            self.sequence_ids = sequence_ids
+            self.logprob_start_len = logprob_start_len
+            return torch.tensor([[42, 102, 103]], dtype=torch.int32), torch.tensor([[-1.0, -2.0, -3.0]])
+
+    class _FakeToolParser:
+        async def extract_tool_calls(self, response_ids, tools):
+            del response_ids, tools
+            return None, []
+
+    loop = SkdAgentLoop.__new__(SkdAgentLoop)
+    loop.teacher_server_manager = _FakeTeacherManager()
+    loop.server_manager = _FakeServerManager()
+    loop.tokenizer = type("_Tok", (), {"eos_token_id": 999})()
+    loop.response_length = 8
+    loop.skd_chunk_size = 4
+    loop.skd_verify_top_k = 3
+    loop.max_chunks_per_sample = 1
+    loop.loss_top_k = 3
+    loop.tools = {}
+    loop.tool_parser = _FakeToolParser()
+    loop.interaction_config_file = None
+    loop.max_assistant_turns = None
+    loop.max_user_turns = None
+
+    agent_data = AgentData(
+        messages=[],
+        image_data=None,
+        video_data=None,
+        metrics={},
+        request_id="req-generate",
+        tools_kwargs={},
+    )
+    agent_data.prompt_ids = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [10, 11, 12, 13]
+
+    next_state = asyncio.run(SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False))
+
+    assert next_state == AgentState.TERMINATED
+    assert loop.teacher_server_manager.sequence_ids == [10, 11, 12, 13, 42]
+    assert loop.teacher_server_manager.logprob_start_len == 3
+    assert agent_data.prompt_ids == [1, 2, 3, 42]
+    assert agent_data.extra_fields["teacher_prompt_ids"] == [10, 11, 12, 13, 42]
+    assert agent_data.extra_fields["teacher_ids_list"] == [[42, 102, 103]]
+    assert agent_data.extra_fields["teacher_logprobs_list"] == [[-1.0, -2.0, -3.0]]

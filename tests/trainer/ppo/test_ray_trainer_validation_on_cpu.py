@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop import (
-    AgentLoopBase,
-    AgentLoopManager,
-    AgentLoopWorker,
-    AsyncLLMServerManager,
-)
-from .diffusion_agent_loop import DiffusionAgentLoopWorker
-from .single_turn_agent_loop import SingleTurnAgentLoop
-from .skd_agent_loop import SkdAgentLoop
-from .tool_agent_loop import ToolAgentLoop
+import numpy as np
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, SkdAgentLoop]
+from verl import DataProto
+from verl.trainer.ppo.ray_trainer import _get_dataproto_batch_size
 
-__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker", "DiffusionAgentLoopWorker"]
+
+def test_get_dataproto_batch_size_with_non_tensor_only_payload():
+    data = DataProto(
+        non_tensor_batch={
+            "raw_prompt": np.array([[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]], dtype=object)
+        }
+    )
+
+    assert _get_dataproto_batch_size(data) == 2

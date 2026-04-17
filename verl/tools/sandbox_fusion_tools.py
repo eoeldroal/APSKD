@@ -74,9 +74,16 @@ class ExecutionWorker:
         return True
 
     def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
-        with ExitStack() as stack:
-            stack.callback(self.rate_limit_worker.release.remote)
-            ray.get(self.rate_limit_worker.acquire.remote())
+        if self.rate_limit_worker:
+            with ExitStack() as stack:
+                stack.callback(self.rate_limit_worker.release.remote)
+                ray.get(self.rate_limit_worker.acquire.remote())
+                try:
+                    return fn(*fn_args, **fn_kwargs)
+                except Exception as e:
+                    # TODO we should make this available to the tool caller
+                    logger.warning(f"Error when executing code: {e}")
+        else:
             try:
                 return fn(*fn_args, **fn_kwargs)
             except Exception as e:

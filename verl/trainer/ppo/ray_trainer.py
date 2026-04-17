@@ -74,6 +74,44 @@ from verl.workers.config import DistillationConfig, FSDPEngineConfig, McoreEngin
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _get_validation_agent_names(
+    agent_names: Optional[np.ndarray],
+    *,
+    default_agent_name: str,
+    batch_size: int,
+) -> Optional[np.ndarray]:
+    """Validation should evaluate the student policy without SKD teacher verification.
+
+    For current SKD experiments, the least disruptive way to do that is to swap
+    ``skd_agent`` to ``tool_agent`` only during validation. ``tool_agent`` still
+    supports tool-calling when tools are configured, and degenerates to a
+    single-turn student-only rollout when no tools are available.
+
+    NOTE:
+    We keep this decision at the trainer/validation entrypoint instead of adding
+    a validation-only branch inside ``skd_agent``. ``skd_agent`` is intentionally
+    teacher-in-the-loop during training; changing its semantics at the loop level
+    would couple validation policy selection to the SKD implementation and make
+    train/val behavior harder to reason about.
+    """
+    validation_agent_name = "tool_agent"
+
+    if agent_names is None:
+        if default_agent_name == "skd_agent":
+            return np.array([validation_agent_name] * batch_size, dtype=object)
+        return None
+
+    return np.array(
+        [validation_agent_name if name == "skd_agent" else name for name in agent_names],
+        dtype=object,
+    )
+
+
+def _get_dataproto_batch_size(data: DataProto) -> int:
+    """Return batch size for tensor or non-tensor-only DataProto payloads."""
+    return len(data)
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -538,7 +576,7 @@ class RayPPOTrainer:
 
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                    [str(uuid.uuid4()) for _ in range(_get_dataproto_batch_size(test_batch))], dtype=object
                 )
 
             # repeat test batch
@@ -552,6 +590,22 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
+            # NOTE:
+            # Validation reuses the same rollout stack as training. Without an
+            # explicit override here, ``validate=True`` would still dispatch
+            # ``skd_agent`` and run teacher verification during evaluation.
+            #
+            # For current SKD runs, validation is intended to score the student
+            # policy itself. We therefore switch only the validation batch from
+            # ``skd_agent`` to ``tool_agent`` here, while leaving the training
+            # path unchanged.
+            validation_agent_names = _get_validation_agent_names(
+                test_gen_batch.non_tensor_batch.get("agent_name"),
+                default_agent_name=self.config.actor_rollout_ref.rollout.agent.default_agent_loop,
+                batch_size=_get_dataproto_batch_size(test_gen_batch),
+            )
+            if validation_agent_names is not None:
+                test_gen_batch.non_tensor_batch["agent_name"] = validation_agent_names
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -1377,6 +1431,11 @@ class RayPPOTrainer:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         self.checkpoint_manager.sleep_replicas()
+                        import torch as _torch
+                        if _torch.cuda.is_available():
+                            _a = _torch.cuda.memory_allocated() / 1024**3
+                            _r = _torch.cuda.memory_reserved() / 1024**3
+                            print(f"[MEMTRACE] POST_GEN_SLEEP | alloc={_a:.2f}G resv={_r:.2f}G", flush=True)
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1493,6 +1552,10 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
 
+                    if _torch.cuda.is_available():
+                        _a = _torch.cuda.memory_allocated() / 1024**3
+                        _r = _torch.cuda.memory_reserved() / 1024**3
+                        print(f"[MEMTRACE] POST_OLD_LOGPROB | alloc={_a:.2f}G resv={_r:.2f}G", flush=True)
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
@@ -1564,6 +1627,10 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        print(
+                            f"[MEMTRACE] PRE_UPDATE_ACTOR | step={self.global_steps}",
+                            flush=True,
+                        )
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 

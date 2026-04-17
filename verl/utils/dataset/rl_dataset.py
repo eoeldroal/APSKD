@@ -26,11 +26,12 @@ from typing import Optional
 import datasets
 import numpy as np
 import torch
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
+from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import normalize_token_ids
 
@@ -119,13 +120,10 @@ class RLHFDataset(Dataset):
         self.tool_schemas = None
         if self.tool_config_path:
             try:
-                from verl.tools.utils.tool_registry import initialize_tools_from_config
-
-                tool_list = initialize_tools_from_config(self.tool_config_path)
-                # match ToolAgentLoop behaviour: model_dump to plain dicts
-                self.tool_schemas = [
-                    tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tool_list
-                ]
+                # Dataset-side prompt filtering only needs tool schemas for chat templating.
+                # Avoid instantiating tool backends here because some tools (for example
+                # SandboxFusionTool) start Ray actors during __init__.
+                self.tool_schemas = self._load_tool_schemas_from_config(self.tool_config_path)
             except Exception as e:
                 logger.warning("Failed to initialize tools from %s: %s", self.tool_config_path, e)
                 self.tool_schemas = None
@@ -143,6 +141,28 @@ class RLHFDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+
+    @staticmethod
+    def _load_tool_schemas_from_config(tool_config_path: str) -> list[dict] | None:
+        tools_config = OmegaConf.load(tool_config_path)
+        tool_schemas = []
+
+        for tool_config in tools_config.tools:
+            tool_schema_cfg = tool_config.get("tool_schema", None)
+            if tool_schema_cfg is None:
+                logger.warning(
+                    "Tool config %s for class %s has no static tool_schema; skipping it during dataset prompt "
+                    "filtering.",
+                    tool_config_path,
+                    tool_config.get("class_name", "<unknown>"),
+                )
+                continue
+
+            tool_schema_dict = OmegaConf.to_container(tool_schema_cfg, resolve=True)
+            tool_schema = OpenAIFunctionToolSchema.model_validate(tool_schema_dict)
+            tool_schemas.append(tool_schema.model_dump(exclude_unset=True, exclude_none=True))
+
+        return tool_schemas or None
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local

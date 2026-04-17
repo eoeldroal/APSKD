@@ -608,12 +608,40 @@ class FSDPEngine(BaseEngine):
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
-        for micro_batch in micro_batches:
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if _rank == 0 and not forward_only:
+            _alloc = torch.cuda.memory_allocated() / 1024**3
+            _resv = torch.cuda.memory_reserved() / 1024**3
+            print(
+                f"[MEMTRACE] PRE_MICRO_LOOP | num_micro_batches={len(micro_batches)} "
+                f"alloc={_alloc:.2f}G resv={_resv:.2f}G",
+                flush=True,
+            )
+
+        for _mb_idx, micro_batch in enumerate(micro_batches):
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
+                if _rank == 0 and not forward_only:
+                    _alloc = torch.cuda.memory_allocated() / 1024**3
+                    _resv = torch.cuda.memory_reserved() / 1024**3
+                    print(
+                        f"[MEMTRACE] POST_FWD mb={_mb_idx}/{len(micro_batches)} "
+                        f"alloc={_alloc:.2f}G resv={_resv:.2f}G",
+                        flush=True,
+                    )
+
                 if not forward_only:
                     loss.backward()
+
+                    if _rank == 0:
+                        _alloc = torch.cuda.memory_allocated() / 1024**3
+                        _resv = torch.cuda.memory_reserved() / 1024**3
+                        print(
+                            f"[MEMTRACE] POST_BWD mb={_mb_idx}/{len(micro_batches)} "
+                            f"alloc={_alloc:.2f}G resv={_resv:.2f}G",
+                            flush=True,
+                        )
 
             output_lst.append(meta_info)
 
