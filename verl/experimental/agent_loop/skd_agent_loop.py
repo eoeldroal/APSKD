@@ -31,6 +31,7 @@ from pathlib import Path
 import time
 import warnings
 from typing import Any
+from uuid import uuid4
 
 import torch
 
@@ -97,7 +98,8 @@ class SkdAgentLoop(ToolAgentLoop):
     def _build_teacher_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Merge teacher-only system guidance into the initial conversation."""
         teacher_messages = deepcopy(messages)
-        if not self.teacher_system_prompt:
+        teacher_system_prompt = getattr(self, "teacher_system_prompt", None)
+        if not teacher_system_prompt:
             return teacher_messages
 
         if teacher_messages and teacher_messages[0].get("role") == "system":
@@ -105,14 +107,80 @@ class SkdAgentLoop(ToolAgentLoop):
             if isinstance(content, str):
                 merged = content.rstrip()
                 if merged:
-                    merged = f"{merged}\n\n{self.teacher_system_prompt}"
+                    merged = f"{merged}\n\n{teacher_system_prompt}"
                 else:
-                    merged = self.teacher_system_prompt
+                    merged = teacher_system_prompt
                 teacher_messages[0]["content"] = merged
                 return teacher_messages
 
-        teacher_messages.insert(0, {"role": "system", "content": self.teacher_system_prompt})
+        teacher_messages.insert(0, {"role": "system", "content": teacher_system_prompt})
         return teacher_messages
+
+    async def _init_boundary_agent_data(self, **kwargs: Any) -> AgentData:
+        """Create AgentData for SKD boundary execution without changing ToolAgentLoop."""
+        messages = list(kwargs["raw_prompt"])
+
+        multi_modal_data = await self.process_vision_info(messages)
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+
+        metrics = {}
+        request_id = uuid4().hex
+        tools_kwargs = kwargs.get("tools_kwargs", {})
+
+        interaction = None
+        interaction_kwargs = {}
+        if self.interaction_config_file:
+            interaction_kwargs = kwargs["extra_info"]["interaction_kwargs"]
+            if "name" not in interaction_kwargs:
+                raise ValueError("'name' key is required in interaction_kwargs")
+            interaction_name = interaction_kwargs["name"]
+            if interaction_name not in self.interaction_map:
+                raise ValueError(
+                    f"Interaction '{interaction_name}' not found in interaction_map. Available interactions: "
+                    f"{list(self.interaction_map.keys())}"
+                )
+            interaction = self.interaction_map[interaction_name]
+            await interaction.start_interaction(request_id, **interaction_kwargs)
+
+        agent_data = AgentData(
+            messages=messages,
+            image_data=images,
+            video_data=videos,
+            metrics=metrics,
+            request_id=request_id,
+            tools_kwargs=tools_kwargs,
+            interaction=interaction,
+            interaction_kwargs=interaction_kwargs,
+        )
+        agent_data.extra_fields["raw_prompt"] = deepcopy(kwargs["raw_prompt"])
+        return agent_data
+
+    def _finalize_boundary_agent_output(self, agent_data: AgentData) -> AgentLoopOutput:
+        """Build AgentLoopOutput from AgentData using ToolAgentLoop-compatible semantics."""
+        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
+        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        multi_modal_data = {}
+        if agent_data.image_data is not None:
+            multi_modal_data["images"] = agent_data.image_data
+        if agent_data.video_data is not None:
+            multi_modal_data["videos"] = agent_data.video_data
+
+        output = AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids[: self.response_length],
+            response_mask=agent_data.response_mask[: self.response_length],
+            multi_modal_data=multi_modal_data,
+            response_logprobs=agent_data.response_logprobs[: self.response_length]
+            if agent_data.response_logprobs
+            else None,
+            num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
+            metrics=agent_data.metrics,
+            routed_experts=agent_data.routed_experts,
+            extra_fields=agent_data.extra_fields,
+        )
+        output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        return output
 
     def _append_student_prompt_delta_to_teacher_stream(self, agent_data: AgentData, prev_prompt_len: int) -> None:
         teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
@@ -340,6 +408,35 @@ class SkdAgentLoop(ToolAgentLoop):
                 return state
 
         return state
+
+    async def run_until_exportable_boundary(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        sample_id: str,
+        logical_step: int,
+        source_type: str,
+        partial_state: SkdPartialState | None = None,
+        **kwargs: Any,
+    ) -> AgentLoopOutput | SkdPartialState:
+        """Run a fresh or resumed SKD trajectory until completion or exportable boundary."""
+        if partial_state is None:
+            agent_data = await self._init_boundary_agent_data(**kwargs)
+            state = AgentState.PENDING
+        else:
+            agent_data, state = self._restore_partial_state(partial_state)
+
+        next_state = await self._run_until_exportable_boundary(agent_data, state, sampling_params)
+        if next_state == AgentState.TERMINATED:
+            return self._finalize_boundary_agent_output(agent_data)
+
+        return self._export_partial_state(
+            agent_data,
+            next_state,
+            sample_id=sample_id,
+            logical_step=logical_step,
+            source_type=source_type,
+        )
 
     def _assert_teacher_alignment(self, agent_data: AgentData) -> None:
         """Validate that response_mask and teacher rows stay response-token aligned."""
