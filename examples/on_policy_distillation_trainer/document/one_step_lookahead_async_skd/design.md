@@ -67,6 +67,8 @@ MVP constraint:
 actor_rollout_ref.rollout.n == 1
 ```
 
+이 값은 mode entry에서 한 번 검증하는 구조적 invariant다. Lookahead admission 시점마다 다시 평가하는 runtime condition이 아니다.
+
 `sample_async` mode는 lookahead 없이 base batch 전체를 sample 단위 remote task로 upfront submit한다. 이는 GPU/server request concurrency를 낮추기 위한 것이 아니다. 기존 `generate_sequences(chunk)` 내부의 `asyncio.gather()`와 같은 수준의 동시 요청을 유지하면서, manager가 sample별 completion event를 볼 수 있게 하기 위한 것이다.
 
 ```text
@@ -626,27 +628,38 @@ Step `k`의 학습 sample 수는:
 B + Delta_k
 ```
 
-Step `k+1`에서는 fresh quota를:
+Step `k+1`에서는 carry-over `R_k`를 먼저 resume하고 fresh quota를:
 
 ```text
-B - Delta_k - R_k
+B - R_k
 ```
 
-로 줄이고, carry-over `R_k`를 먼저 소비한다.
+로 둔다. Promoted `Delta_k`는 이미 step `k`에서 학습에 들어간 reserved future sample이다. 따라서 step `k+1` fresh quota에서 다시 차감하지 않는다. 대신 source/reservation ledger가 해당 sample을 다시 emit하지 않도록 보장한다.
 
 Step `k+1`의 학습 sample 수는:
 
 ```text
-(B - Delta_k - R_k) + R_k = B - Delta_k
+(B - R_k) + R_k = B
 ```
 
 두 step 합은:
 
 ```text
-(B + Delta_k) + (B - Delta_k) = 2B
+(B + Delta_k) + B = 2B + Delta_k
 ```
 
-즉 sample accounting은 보존된다. 이 방법은 데이터를 더 많이 쓰는 것이 아니라, next-step sample 일부를 current step으로 당겨 쓰는 방법이다.
+즉 finished lookahead promotion은 실제 train sample throughput을 늘린다. Sample identity accounting은 source ledger로 보존한다. 같은 prompt가 중복 학습되면 안 되며, promoted prompt는 다음 step에서 다시 fresh로 나오면 안 된다.
+
+예시:
+
+```text
+B = 96
+Delta_k = 18
+R_k = 30
+
+step k train batch = 96 + 18 = 114
+step k+1 current work = resume 30 + fresh 66 = 96
+```
 
 ### 4.7 Dataset Sampling And Reservation Layer
 
@@ -689,8 +702,8 @@ Sample provider가 지켜야 할 핵심 불변식은 다음이다.
 1. 동일 sample은 active window 안에서 중복 소비되지 않는다.
 2. lookahead는 current_step + 1 sample까지만 reserve한다.
 3. step 중 lookahead budget은 refill하지 않는다.
-4. promoted sample은 next-step fresh quota에서 차감한다.
-5. carry-over sample도 next-step fresh quota에서 차감한다.
+4. promoted sample은 source/reservation ledger에서 중복 방지 대상으로 기록한다.
+5. carry-over sample은 next-step fresh quota에서 차감한다.
 6. provider state는 checkpoint 가능해야 한다.
 ```
 
@@ -969,12 +982,13 @@ for step_id in training_steps:
     train_on(train_batch)
     update_student()
 
-    next_fresh_quota = B - len(promoted) - len(carryover_next)
+    next_fresh_quota = B - len(carryover_next)
     next_fresh_quota = max(0, next_fresh_quota)
 
     next_step_buffer = {
         "carryover": carryover_next,
         "fresh_quota": next_fresh_quota,
+        "already_trained_reserved": promoted,
     }
 
     drop_all_samples_with_age_gt_1()
@@ -1221,7 +1235,8 @@ Trainer:
 
 ```python
 assemble_step_batch(base_samples, promoted_samples)
-compute_next_step_fresh_quota(B, promoted_count, carryover_count)
+compute_next_step_fresh_quota(B, carryover_count)
+mark_promoted_samples_trained(promoted_samples)
 drop_expired_carryover_samples()
 log_source_aware_metrics(batch)
 compute_logprob_drift(batch)
@@ -1459,11 +1474,11 @@ teacher row = dummy row
 ### 11.2 Sample Accounting Invariants
 
 - A prompt is consumed exactly once.
-- A promoted sample is subtracted from next-step fresh quota.
+- A promoted sample is recorded in the source ledger and must not be emitted again.
 - A carry-over sample is either resumed in the next step or dropped.
 - No sample with age greater than 1 enters training.
 - Step-level batch size may be dynamic.
-- Two-step sample budget is preserved.
+- Current-step work size is preserved by `fresh_quota = B - carryover_count`; promoted samples increase throughput.
 
 ### 11.3 Atomicity Invariants
 

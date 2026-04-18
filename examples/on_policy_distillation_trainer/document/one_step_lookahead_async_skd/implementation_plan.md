@@ -792,10 +792,23 @@ drain_requested
 
 ### 10.1 Lookahead Admission Rule
 
+Mode entry에서 한 번 검증할 구조적 invariant:
+
+```text
+rollout.n == 1
+```
+
+이 값은 sample-level scheduling의 전제다. Step 중 admission predicate에 매번 섞지 않는다.
+
+Runtime admission predicate:
+
 ```text
 lookahead target step = current_step + 1
 lookahead_started_count <= L_prefetch
 budget is not refilled within the same step
+drain_requested == False
+base_active_tasks > 0
+future source has next sample
 ```
 
 `L_prefetch`는 sample 단위로 계산한다. `rollout.n == 1`이므로 prompt/sample/trajectory 단위가 일치한다.
@@ -850,13 +863,27 @@ promoted_count = Delta_k
 carryover_count = R_k
 ```
 
-라면 step `k+1`의 fresh quota는:
+라면 step `k+1`의 current work 구성은:
 
 ```text
-fresh_quota_{k+1} = B - Delta_k - R_k
+resume_carryover_{k+1} = R_k
+fresh_quota_{k+1} = B - R_k
 ```
 
-이다. 이 quota는 dataloader에서 다음 fresh samples를 소비하는 지점에서 enforce한다.
+이다. `Delta_k`는 step `k`에서 이미 학습된 reserved future samples 수다. 따라서 step `k+1` fresh quota에서 다시 차감하지 않는다. 대신 source/reservation ledger가 `Delta_k` sample을 다시 emit하지 않도록 보장해야 한다.
+
+예시:
+
+```text
+B = 96
+Delta_k = 18
+R_k = 30
+
+step k train batch = 96 + 18 = 114
+step k+1 current work = resume 30 + fresh 66 = 96
+```
+
+`lookahead_started_count`는 step-local counter이며 step `k+1`에서 다시 0부터 시작한다.
 
 ## 12. Phase 9: Trainer Integration
 
@@ -1174,7 +1201,8 @@ Changes:
 Expected behavior:
 
 - no duplicate or skipped prompt under lookahead.
-- next fresh quota respects promoted/carryover count.
+- next fresh quota is `B - carryover_count`.
+- promoted samples are tracked in the source ledger for duplicate prevention, not subtracted from next-step fresh quota.
 
 ### Patch 9: Persistent Weight Sync
 
@@ -1246,7 +1274,8 @@ max(version_span) <= 1
 
 ```text
 started_lookahead <= L_prefetch
-next_fresh_quota = B - promoted_count - carryover_count
+next_fresh_quota = B - carryover_count
+promoted_count affects source duplicate prevention only
 no k+2 sample admitted
 ```
 
