@@ -151,7 +151,7 @@ Do not copy directly:
 
 - 기존 `MessageQueue`는 full이면 oldest sample을 silent drop한다.
 - existing `FullyAsyncAgentLoopManager`는 distillation enabled에서 막혀 있다.
-- existing partial rollout은 abort/resume 중심이고, SKD는 committed-unit-boundary pause가 필요하다.
+- existing partial rollout은 abort/resume 중심이고, SKD는 handler-return export-predicate pause가 필요하다.
 - 현재 구현 단계에서는 Ray actor queue를 만들지 않는다. Manager 내부 task set과 local state로 충분하다.
 
 ### 2.4 Reuse And Inheritance Map
@@ -211,9 +211,9 @@ verl/experimental/async_skd/manager.py
 
 초기 구현에서는 `manager.py`가 scheduler 역할을 함께 가진다. `queue.py`, 별도 `scheduler.py`, 별도 `ray_trainer.py`는 실제로 producer/consumer 분리가 필요해질 때만 추가한다.
 
-## 4. Phase 1: Last-Committed-Unit Instrumentation
+## 4. Phase 1: Prefix Accounting And Export Predicate
 
-목표: 동작을 바꾸지 않고, SKD agent loop가 마지막으로 완전히 commit한 atomic unit을 기록한다.
+목표: 동작을 바꾸지 않고, SKD agent loop가 lookahead/carry-over에 필요한 실질 상태를 기록하고 export predicate를 label enum 없이 판단한다.
 
 대상 파일:
 
@@ -226,23 +226,19 @@ verl/experimental/agent_loop/skd_agent_loop.py
 추가 함수:
 
 ```python
-def _set_skd_last_committed_unit(self, agent_data: AgentData, unit: str) -> None:
-    ...
-
-def _get_skd_last_committed_unit(self, agent_data: AgentData) -> str | None:
-    ...
-
 def _record_rollout_version_from_output(self, agent_data: AgentData, output) -> None:
     ...
 
 def _increment_skd_prefix_stats(self, agent_data: AgentData) -> dict:
+    ...
+
+def _is_qwen_hermes_tool_boundary_exportable(self, agent_data: AgentData) -> bool:
     ...
 ```
 
 저장 위치:
 
 ```text
-agent_data.extra_fields["skd_last_committed_unit"]
 agent_data.extra_fields["rollout_min_version"]
 agent_data.extra_fields["rollout_max_version"]
 agent_data.extra_fields["skd_committed_gen_chunks"]
@@ -252,9 +248,9 @@ agent_data.extra_fields["skd_committed_prefix_tokens"]
 
 왜 필요한가:
 
-- Scheduler가 pause 가능한 지점을 알아야 한다.
 - 나중에 partial carryover가 `version_span <= 1`인지 판단해야 한다.
-- Tool macro-step이 닫혔는지 외부 scheduler가 확인할 수 있어야 한다.
+- Stale prefix budget은 old generation chunks, old env units, old prefix tokens에 의해 판단된다.
+- Tool-call export safety는 Qwen/Hermes EOS-gated parser state에 의해 판단된다.
 
 ### 4.2 Modify `_handle_generating_state()`
 
@@ -268,12 +264,6 @@ teacher row append
 _assert_teacher_alignment()
 ```
 
-이 직후:
-
-```python
-self._set_skd_last_committed_unit(agent_data, "ASSISTANT_GEN_CHUNK")
-```
-
 그리고 committed assistant token 수만큼:
 
 ```python
@@ -285,8 +275,8 @@ skd_committed_prefix_tokens += len(new_tokens)
 
 왜 필요한가:
 
-- `ASSISTANT_GEN_CHUNK`는 SKD chunk 단위에서 가장 작은 committed-unit boundary다.
 - teacher rows와 response mask가 이미 맞춰진 상태이므로 snapshot 가능하다.
+- 단, snapshot 가능 여부는 label이 아니라 `_can_export_partial_state()`가 판단한다.
 
 확인 포인트:
 
@@ -311,12 +301,6 @@ self._assert_teacher_alignment(agent_data)
 이 직후:
 
 ```python
-self._set_skd_last_committed_unit(agent_data, "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT")
-```
-
-그리고:
-
-```python
 skd_committed_env_units += 1
 skd_committed_prefix_tokens += appended_len
 ```
@@ -324,7 +308,7 @@ skd_committed_prefix_tokens += appended_len
 왜 필요한가:
 
 - Tool result span은 `response_mask=0`과 dummy teacher row가 같이 붙어야 한다.
-- Tool execution 중간 상태는 carryover snapshot으로 쓰면 안 된다.
+- Manager-level export는 handler 반환 뒤에만 일어나므로 tool execution 중간 상태는 정상 export 후보가 아니다.
 
 확인 포인트:
 
@@ -336,7 +320,6 @@ skd_committed_prefix_tokens += appended_len
 `_handle_processing_tools_state()`와 같은 방식으로:
 
 ```python
-self._set_skd_last_committed_unit(agent_data, "ASSISTANT_GEN_CHUNK_WITH_INTERACTION_RESULT")
 skd_committed_env_units += 1
 skd_committed_prefix_tokens += appended_len
 ```
@@ -356,16 +339,27 @@ skd_committed_prefix_tokens += appended_len
 verl/experimental/async_skd/state.py
 ```
 
-### 5.1 Keep Only Boundary Enum
+### 5.1 Remove Boundary Enum
 
-```python
-class SkdCommittedUnit(str, Enum):
-    ASSISTANT_GEN_CHUNK = "ASSISTANT_GEN_CHUNK"
-    ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT = "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
-    ASSISTANT_GEN_CHUNK_WITH_INTERACTION_RESULT = "ASSISTANT_GEN_CHUNK_WITH_INTERACTION_RESULT"
+Remove:
+
+```text
+SkdCommittedUnit
+RESUMABLE_COMMITTED_UNITS
+SkdPartialState.last_committed_unit
+AsyncSkdSample validation that checks last_committed_unit
+extra_fields["skd_last_committed_unit"]
 ```
 
-`SkdCommittedUnit`은 tool macro-step atomicity와 resume 가능 boundary를 표현하므로 유지한다. 반면 source label은 scheduler accounting용 문자열이므로 별도 enum으로 만들지 않는다. `source_type`은 `AsyncSkdSample.validate()`에서 허용 문자열을 검사한다.
+Export/restore correctness must be based on serialized state and real predicates:
+
+```text
+next_state == GENERATING
+teacher row alignment
+Qwen/Hermes tool-boundary exportability
+```
+
+`source_type` remains a scheduler accounting string and is still validated in `AsyncSkdSample.validate()`.
 
 허용 source label:
 
@@ -386,7 +380,6 @@ class SkdPartialState:
     logical_step: int
     source_type: str
     agent_state: str
-    last_committed_unit: str
     request_id: str
     tools_kwargs: dict[str, Any]
     committed_gen_chunks: int
@@ -525,12 +518,13 @@ def _export_partial_state(
 
 ```python
 self._assert_teacher_alignment(agent_data)
-assert agent_data.extra_fields["skd_last_committed_unit"] in allowed_committed_units
+assert next_state == AgentState.GENERATING
+assert self._is_qwen_hermes_tool_boundary_exportable(agent_data)
 ```
 
 왜 필요한가:
 
-- Carryover는 committed-unit boundary에서만 저장해야 한다.
+- Carryover는 handler-return export boundary에서만 저장해야 한다.
 - Export 시점에 alignment를 다시 확인해야 downstream 오류를 줄인다.
 
 ### 6.2 Add `_restore_partial_state()`
@@ -565,19 +559,20 @@ def _restore_partial_state(
 ### 6.3 Add `_can_export_partial_state()`
 
 ```python
-def _can_export_partial_state(self, agent_data: AgentData) -> bool:
-    unit = self._get_skd_last_committed_unit(agent_data)
-    return unit in {
-        "ASSISTANT_GEN_CHUNK",
-        "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT",
-        "ASSISTANT_GEN_CHUNK_WITH_INTERACTION_RESULT",
-    }
+def _can_export_partial_state(self, agent_data: AgentData, next_state: AgentState) -> bool:
+    return (
+        next_state == AgentState.GENERATING
+        and self._teacher_alignment_ok(agent_data)
+        and self._is_qwen_hermes_tool_boundary_exportable(agent_data)
+    )
 ```
 
 추가 rule:
 
-- tool call이 완성되었고 아직 tool result가 없다면 `ASSISTANT_GEN_CHUNK` carryover를 되도록 금지한다.
-- 이 경우 scheduler는 `ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT`까지 진행시키는 쪽을 선택한다.
+- EOS 없는 open tool-call prefix는 export 가능하다.
+- EOS 없는 closed `</tool_call>` block은 export 금지다.
+- EOS 있는 valid tool call은 `PROCESSING_TOOLS`로 진행하고, tool result append 후 export한다.
+- EOS 있는 no-tool assistant turn은 interaction 또는 termination으로 진행한다.
 
 ## 7. Phase 4: Async SKD Worker Execution Primitives
 
@@ -744,7 +739,7 @@ Rule:
 
 ## 9. Phase 6: Cooperative SKD Boundary Return
 
-목표: lookahead sample을 강제로 cancel하지 않고, 다음 exportable committed-unit boundary에서 manager에게 제어권을 돌려준다.
+목표: lookahead sample을 강제로 cancel하지 않고, 다음 exportable handler-return boundary에서 manager에게 제어권을 돌려준다.
 
 대상 파일:
 
@@ -770,8 +765,8 @@ async def _handle_generating_state(
 - SKD chunk 하나를 생성한다.
 - teacher verification과 first-rejection commit을 끝낸다.
 - teacher rows와 `response_mask` alignment를 확인한다.
-- `skd_last_committed_unit = ASSISTANT_GEN_CHUNK`를 기록한다.
-- EOS/budget/max chunk가 아니면 `AgentState.GENERATING`을 반환한다.
+- EOS가 있으면 parser/interaction/termination 분기를 처리한다.
+- EOS가 없고 Qwen/Hermes tool boundary가 export 가능한 경우 `AgentState.GENERATING`을 반환한다.
 
 기존 full rollout path는 `stop_after_committed_unit=False`이므로 그대로 끝까지 진행한다.
 
@@ -1408,7 +1403,7 @@ Do not inherit the GKD trainer. Copy only the weight-sync mechanics and version 
 
 한 번에 크게 바꾸지 않는다.
 
-### Patch 1: Safe-Point Metadata Only
+### Patch 1: Prefix Accounting And Export Predicate
 
 Files:
 
@@ -1418,10 +1413,9 @@ skd_agent_loop.py
 
 Changes:
 
-- `_set_skd_last_committed_unit()`
 - `_record_rollout_version_from_output()`
 - `_increment_skd_prefix_stats()`
-- generating/tool/interact committed-unit writes
+- Qwen/Hermes tool-boundary export predicate
 
 Expected behavior:
 
@@ -1441,7 +1435,6 @@ Changes:
 
 - `SkdPartialState`
 - `AsyncSkdSample`
-- `SkdCommittedUnit`
 - avoid `LookaheadTaskState`; manager active task bookkeeping uses `asyncio.Task` collections
 - remove/avoid `SkdCompletedSample`
 - remove/avoid `SkdSampleSource` enum; validate `source_type` strings in `AsyncSkdSample.validate()`
@@ -1533,7 +1526,7 @@ Changes:
 Expected behavior:
 
 - 기존 full rollout path는 그대로.
-- lookahead path는 `ASSISTANT_GEN_CHUNK` 또는 tool/interact closed boundary에서 반환 가능.
+- lookahead path returns only after handler-return export predicate succeeds.
 - chunk pause 후 export/restore/resume 가능.
 
 ### Patch 7: Manager Lookahead Scheduling
@@ -1846,6 +1839,6 @@ work-conserving under bounded-staleness constraints
 
 - GKD처럼 staleness를 받아들이지만, batch 전체를 stale로 만들지는 않는다.
 - Finished lookahead는 age 0이므로 current batch에 promote한다.
-- Unfinished lookahead는 committed-unit boundary에서만 carryover한다.
+- Unfinished lookahead는 handler-return export predicate를 만족할 때만 carryover한다.
 - Tool result는 loss 대상이 아니지만 tool macro-step으로 atomic하게 다룬다.
 - Current-policy forward가 stale logits 문제는 없애지만, context distribution shift는 남으므로 drift metric을 보고한다.
