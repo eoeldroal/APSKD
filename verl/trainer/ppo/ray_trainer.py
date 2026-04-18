@@ -588,6 +588,23 @@ class RayPPOTrainer:
             self.async_rollout_manager.set_async_skd_data_source(source)
         return source
 
+    def _append_async_skd_promoted_inputs(self, batch: DataProto) -> DataProto:
+        source = getattr(self, "_async_skd_data_source", None)
+        if source is None or not hasattr(source, "pop_promoted_input_batches"):
+            return batch
+
+        promoted_inputs = source.pop_promoted_input_batches()
+        if not promoted_inputs:
+            return batch
+
+        train_ready_promoted_inputs = []
+        for promoted_input in promoted_inputs:
+            self._ensure_batch_uid(promoted_input)
+            self._get_gen_batch(promoted_input)
+            train_ready_promoted_inputs.append(promoted_input)
+
+        return DataProto.concat([batch] + train_ready_promoted_inputs)
+
     def _iter_training_batches(self):
         if not self._is_async_skd_lookahead_enabled():
             for batch_dict in self.train_dataloader:
@@ -1516,6 +1533,8 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        if self._is_async_skd_lookahead_enabled():
+                            batch = self._append_async_skd_promoted_inputs(batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):

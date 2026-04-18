@@ -28,6 +28,7 @@ class AsyncSkdDataSource:
         self._carryover_partials: list[SkdPartialState] = []
         self._carryover_input_batches: list[DataProto] = []
         self._reserved_input_batches: dict[str, DataProto] = {}
+        self._promoted_input_batches: list[DataProto] = []
         self._trained_reserved_sample_ids: set[str] = set()
 
     @property
@@ -79,9 +80,17 @@ class AsyncSkdDataSource:
     def record_promoted(self, samples: list[AsyncSkdSample]) -> None:
         """Record promoted lookahead samples as already trained reserved samples."""
         for sample in samples:
-            sample.validate()
+            sample.require_completed()
             self._trained_reserved_sample_ids.add(sample.sample_id)
-            self._reserved_input_batches.pop(sample.sample_id, None)
+            input_batch = self._reserved_input_batches.pop(sample.sample_id, None)
+            if input_batch is not None:
+                self._promoted_input_batches.append(copy.deepcopy(input_batch))
+
+    def pop_promoted_input_batches(self) -> list[DataProto]:
+        """Return promoted input rows once, in the same order as recorded promoted outputs."""
+        promoted_inputs = self._promoted_input_batches
+        self._promoted_input_batches = []
+        return promoted_inputs
 
     def record_carryover(
         self,
@@ -159,6 +168,7 @@ class AsyncSkdDataSource:
             "carryover_partials": copy.deepcopy(self._carryover_partials),
             "carryover_input_batches": copy.deepcopy(self._carryover_input_batches),
             "reserved_input_batches": copy.deepcopy(self._reserved_input_batches),
+            "promoted_input_batches": copy.deepcopy(self._promoted_input_batches),
             "trained_reserved_sample_ids": sorted(self._trained_reserved_sample_ids),
         }
 
@@ -168,4 +178,5 @@ class AsyncSkdDataSource:
         self._carryover_partials = copy.deepcopy(state.get("carryover_partials", []))
         self._carryover_input_batches = copy.deepcopy(state.get("carryover_input_batches", []))
         self._reserved_input_batches = copy.deepcopy(state.get("reserved_input_batches", {}))
+        self._promoted_input_batches = copy.deepcopy(state.get("promoted_input_batches", []))
         self._trained_reserved_sample_ids = set(state.get("trained_reserved_sample_ids", []))

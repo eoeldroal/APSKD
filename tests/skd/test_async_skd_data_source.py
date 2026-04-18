@@ -164,6 +164,27 @@ def test_data_source_reserves_lookahead_and_records_promoted_without_reducing_fr
     assert sample_id in source.trained_reserved_sample_ids
 
 
+def test_data_source_returns_promoted_input_rows_once_in_promoted_order():
+    source = AsyncSkdDataSource(_BatchIterator([_batch_dict(0, 4)]), uid_fn=_UidFactory())
+
+    reserved_0 = source.reserve_lookahead(logical_step=1)
+    reserved_1 = source.reserve_lookahead(logical_step=1)
+    assert reserved_0 is not None and reserved_1 is not None
+    sample_id_0, sample_0 = reserved_0
+    sample_id_1, sample_1 = reserved_1
+
+    source.record_promoted([
+        _completed(sample_id_0, sample_0),
+        _completed(sample_id_1, sample_1),
+    ])
+
+    promoted_inputs = source.pop_promoted_input_batches()
+
+    assert [batch.non_tensor_batch["uid"].tolist()[0] for batch in promoted_inputs] == [sample_id_0, sample_id_1]
+    assert [batch.non_tensor_batch["input_pos"].tolist()[0] for batch in promoted_inputs] == [0, 1]
+    assert source.pop_promoted_input_batches() == []
+
+
 def test_data_source_state_dict_restores_fresh_buffer_and_ledgers():
     source = AsyncSkdDataSource(_BatchIterator([_batch_dict(0, 3)]), uid_fn=_UidFactory())
     first = source.pop_fresh_sample()
@@ -185,3 +206,20 @@ def test_data_source_state_dict_restores_fresh_buffer_and_ledgers():
     assert fresh.non_tensor_batch["input_pos"].tolist() == [2]
     assert current_input is not None
     assert current_input.non_tensor_batch["input_pos"].tolist() == [100, 2]
+
+
+def test_data_source_state_dict_restores_unconsumed_promoted_input_rows():
+    source = AsyncSkdDataSource(_BatchIterator([_batch_dict(0, 2)]), uid_fn=_UidFactory())
+    reserved = source.reserve_lookahead(logical_step=1)
+    assert reserved is not None
+    sample_id, sample = reserved
+    source.record_promoted([_completed(sample_id, sample)])
+
+    restored = AsyncSkdDataSource(_BatchIterator([]), uid_fn=_UidFactory())
+    restored.load_state_dict(source.state_dict())
+
+    promoted_inputs = restored.pop_promoted_input_batches()
+
+    assert len(promoted_inputs) == 1
+    assert promoted_inputs[0].non_tensor_batch["uid"].tolist() == [sample_id]
+    assert promoted_inputs[0].non_tensor_batch["input_pos"].tolist() == [0]

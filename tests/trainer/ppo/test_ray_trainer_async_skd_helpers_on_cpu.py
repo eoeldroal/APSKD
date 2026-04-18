@@ -5,6 +5,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from verl.experimental.async_skd.data_source import AsyncSkdDataSource
+from verl.experimental.async_skd.state import AsyncSkdSample
 from verl.protocol import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
@@ -19,6 +21,16 @@ class _FakeDataLoader:
 
     def __len__(self):
         return len(self._batches)
+
+
+class _UidFactory:
+    def __init__(self):
+        self._next = 0
+
+    def __call__(self) -> str:
+        value = f"uid-{self._next}"
+        self._next += 1
+        return value
 
 
 class _FakeRolloutManager:
@@ -37,6 +49,15 @@ def _batch_dict(start: int, count: int) -> dict:
         "raw_prompt": np.array([[{"role": "user", "content": f"q-{value}"}] for value in values], dtype=object),
         "reward_model": np.array([{"ground_truth": str(value)} for value in values], dtype=object),
     }
+
+
+def _completed(sample_id: str, batch: DataProto) -> AsyncSkdSample:
+    return AsyncSkdSample.from_completed(
+        sample_id=sample_id,
+        logical_step=4,
+        source_type="lookahead",
+        batch=batch,
+    )
 
 
 def _make_trainer(
@@ -121,3 +142,39 @@ def test_iter_training_batches_lookahead_rejects_unsupported_modes(kwargs, match
 
     with pytest.raises(ValueError, match=match):
         list(trainer._iter_training_batches())
+
+
+def test_append_async_skd_promoted_inputs_extends_training_batch_once():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(0, 2)])
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(100, 2)])), uid_fn=_UidFactory())
+    trainer._async_skd_data_source = source
+
+    reserved_0 = source.reserve_lookahead(logical_step=1)
+    reserved_1 = source.reserve_lookahead(logical_step=1)
+    assert reserved_0 is not None and reserved_1 is not None
+    sample_id_0, sample_0 = reserved_0
+    sample_id_1, sample_1 = reserved_1
+    source.record_promoted([
+        _completed(sample_id_0, sample_0),
+        _completed(sample_id_1, sample_1),
+    ])
+
+    batch = DataProto.from_single_dict(_batch_dict(0, 2))
+    batch.non_tensor_batch["uid"] = np.array(["base-0", "base-1"], dtype=object)
+    trainer._get_gen_batch(batch)
+
+    extended = trainer._append_async_skd_promoted_inputs(batch)
+
+    assert len(extended) == 4
+    assert extended.non_tensor_batch["uid"].tolist() == ["base-0", "base-1", sample_id_0, sample_id_1]
+    assert [item["ground_truth"] for item in extended.non_tensor_batch["reward_model"]] == [
+        "0",
+        "1",
+        "100",
+        "101",
+    ]
+    assert extended.batch["dummy_tensor"].squeeze(-1).tolist() == [0, 1, 100, 101]
+
+    unchanged = trainer._append_async_skd_promoted_inputs(extended)
+
+    assert len(unchanged) == 4
