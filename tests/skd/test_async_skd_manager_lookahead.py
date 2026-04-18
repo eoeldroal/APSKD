@@ -302,6 +302,63 @@ async def test_manager_generate_sequences_with_carryover_rejects_rollout_n_great
 
 
 @pytest.mark.asyncio
+async def test_carryover_path_admits_lookahead_and_appends_promoted_after_current_work():
+    manager, calls, source = _make_manager(
+        prefetch_limit=2,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+        ],
+        lookahead_results={
+            "carry-200": [_make_completed_sample("carry-200", 200, source_type="resumed_current")],
+            "carry-201": [_make_completed_sample("carry-201", 201, source_type="resumed_current")],
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+        },
+        base_delays={0: 0.05, 1: 0.05},
+    )
+
+    output = await manager.generate_sequences_with_carryover(
+        fresh_prompts=_make_prompts(2),
+        carryover_partials=[_make_partial("carry-200"), _make_partial("carry-201")],
+    )
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [200, 201, 0, 1, 100, 101]
+    assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100", "lookahead-101"]
+    assert source.carryover_partials == []
+    assert [call[1] for call in calls].count("lookahead") == 2
+    assert output.meta_info["timing"]["async_skd/lookahead_started_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_carryover_path_drain_stops_lookahead_refill():
+    manager, calls, source = _make_manager(
+        prefetch_limit=8,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "carry-200": [_make_completed_sample("carry-200", 200, source_type="resumed_current")],
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+    )
+
+    await manager.generate_sequences_with_carryover(
+        fresh_prompts=None,
+        carryover_partials=[_make_partial("carry-200")],
+    )
+
+    assert [call[1] for call in calls].count("lookahead") == 0
+    assert len(source.source_items) == 4
+
+
+@pytest.mark.asyncio
 async def test_lookahead_manager_promotes_completed_samples_after_base_outputs():
     manager, calls, source = _make_manager(
         prefetch_limit=2,
