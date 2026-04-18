@@ -540,6 +540,70 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _ensure_batch_uid(self, batch: DataProto) -> None:
+        if "uid" in batch.non_tensor_batch:
+            return
+        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
+
+    def _async_skd_mode(self) -> str:
+        mode = OmegaConf.select(self.config, "actor_rollout_ref.rollout.agent.async_skd_mode", default=None)
+        if mode is None:
+            mode = OmegaConf.select(self.config, "distillation.async_skd.mode", default="sync")
+        return str(mode)
+
+    def _is_async_skd_lookahead_enabled(self) -> bool:
+        return self._async_skd_mode() == "lookahead"
+
+    def _async_skd_base_batch_size(self) -> int:
+        return int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
+
+    def _validate_async_skd_lookahead_constraints(self) -> None:
+        rollout_n = int(OmegaConf.select(self.config, "actor_rollout_ref.rollout.n", default=1))
+        if rollout_n != 1:
+            raise ValueError(f"async SKD lookahead requires rollout.n == 1, got {rollout_n}")
+
+        adv_estimator = self.config.algorithm.adv_estimator
+        if str(adv_estimator).lower() == "remax" or adv_estimator == AdvantageEstimator.REMAX:
+            raise ValueError("async SKD lookahead does not support REMAX yet")
+
+        rollout_skip_enabled = bool(
+            OmegaConf.select(self.config, "actor_rollout_ref.rollout.skip.enable", default=False)
+        )
+        if rollout_skip_enabled:
+            raise ValueError("async SKD lookahead does not support rollout skip yet")
+
+        if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+            raise ValueError("async SKD lookahead does not support curriculum sampler yet")
+
+        if not hasattr(self.async_rollout_manager, "set_async_skd_data_source"):
+            raise ValueError("async SKD lookahead requires AsyncSkdAgentLoopManager-compatible rollout manager")
+
+    def _ensure_async_skd_data_source(self):
+        source = getattr(self, "_async_skd_data_source", None)
+        if source is None:
+            from verl.experimental.async_skd.data_source import AsyncSkdDataSource
+
+            source = AsyncSkdDataSource(iter(self.train_dataloader))
+            self._async_skd_data_source = source
+            self.async_rollout_manager.set_async_skd_data_source(source)
+        return source
+
+    def _iter_training_batches(self):
+        if not self._is_async_skd_lookahead_enabled():
+            for batch_dict in self.train_dataloader:
+                batch = DataProto.from_single_dict(batch_dict)
+                yield [], batch, batch
+            return
+
+        self._validate_async_skd_lookahead_constraints()
+        source = self._ensure_async_skd_data_source()
+        base_batch_size = self._async_skd_base_batch_size()
+        for _ in range(len(self.train_dataloader)):
+            carryover, fresh_batch, current_input_batch = source.next_current_batch(base_batch_size)
+            if current_input_batch is None:
+                break
+            yield carryover, fresh_batch, current_input_batch
+
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
         compute reward use colocate reward model
@@ -1395,7 +1459,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for carryover_partials, fresh_batch, batch in self._iter_training_batches():
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1407,21 +1471,26 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
+                self._ensure_batch_uid(batch)
 
-                gen_batch = self._get_gen_batch(batch)
+                if carryover_partials:
+                    gen_batch = self._get_gen_batch(fresh_batch) if fresh_batch is not None else None
+                    gen_batch_output = None
+                    if gen_batch is not None:
+                        gen_batch.meta_info["global_steps"] = self.global_steps
+                        gen_batch_output = gen_batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
+                else:
+                    gen_batch = self._get_gen_batch(batch)
 
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1429,7 +1498,13 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        if carryover_partials:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences_with_carryover(
+                                fresh_prompts=gen_batch_output,
+                                carryover_partials=carryover_partials,
+                            )
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         self.checkpoint_manager.sleep_replicas()
                         import torch as _torch
                         if _torch.cuda.is_available():

@@ -1277,6 +1277,8 @@ This path completes carry-over samples first and fresh samples second. It does n
 Trainer:
 
 ```python
+ensure_batch_uid(batch)
+iter_training_batches() -> tuple[carryover_partials, fresh_batch, current_input_batch]
 assemble_step_batch(base_samples, promoted_samples)
 compute_next_step_fresh_quota(B, carryover_count)
 mark_promoted_samples_trained(promoted_samples)

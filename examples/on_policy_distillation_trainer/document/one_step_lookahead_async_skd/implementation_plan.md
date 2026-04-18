@@ -1021,13 +1021,42 @@ actor_rollout_ref.rollout.n=1
 actor_rollout_ref.rollout.agent.async_skd_mode=lookahead
 ```
 
-Trainer loop 자체는 가능한 한 유지한다.
+Trainer loop 자체는 가능한 한 유지하되, batch acquisition은 helper로 분리한다.
 
 ```text
-for batch_dict in self.train_dataloader:
-    batch = DataProto.from_single_dict(batch_dict)
-    gen_batch = self._get_gen_batch(batch)
-    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+_iter_training_batches()
+  sync/sample_async:
+    -> [], batch, batch
+  lookahead:
+    -> carryover_partials, fresh_batch, current_input_batch
+```
+
+Trainer entry helpers:
+
+```text
+_ensure_batch_uid(batch)
+_async_skd_mode()
+_is_async_skd_lookahead_enabled()
+_validate_async_skd_lookahead_constraints()
+_ensure_async_skd_data_source()
+```
+
+MVP guard:
+
+```text
+rollout.n == 1
+REMAX disabled
+rollout skip disabled
+curriculum sampler disabled
+AsyncSkdAgentLoopManager-compatible rollout manager required
+```
+
+Lookahead mode generation:
+
+```text
+fresh_batch -> _get_gen_batch(fresh_batch)
+carryover_partials + fresh_gen_batch -> generate_sequences_with_carryover(...)
+current_input_batch.union(gen_batch_output)
 ```
 
 Dynamic batch size `B + promoted_count`가 생기는 시점에는 reward/advantage/update path가 실제 token mask 기준으로 normalize되는지 별도 검증한다.
