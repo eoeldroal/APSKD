@@ -45,6 +45,12 @@ def _batch_dict(start: int, count: int) -> dict:
     }
 
 
+def _single_input_row(value: int, uid: str) -> DataProto:
+    batch = DataProto.from_single_dict(_batch_dict(value, 1))
+    batch.non_tensor_batch["uid"] = np.array([uid], dtype=object)
+    return batch
+
+
 def _partial(sample_id: str) -> SkdPartialState:
     return SkdPartialState(
         sample_id=sample_id,
@@ -97,14 +103,40 @@ def test_data_source_lazily_converts_batch_dicts_to_single_sample_dataproto():
 
 def test_data_source_builds_current_batch_with_carryover_first_and_fresh_quota():
     source = AsyncSkdDataSource(_BatchIterator([_batch_dict(10, 4)]), uid_fn=_UidFactory())
-    source.record_carryover([_partial("carry-0"), _partial("carry-1")])
+    source.record_carryover(
+        [_partial("carry-0"), _partial("carry-1")],
+        input_batches=[_single_input_row(100, "carry-0"), _single_input_row(101, "carry-1")],
+    )
 
-    carryover, fresh = source.next_current_batch(base_batch_size=4)
+    carryover, fresh, current_input = source.next_current_batch(base_batch_size=4)
 
     assert [partial.sample_id for partial in carryover] == ["carry-0", "carry-1"]
     assert fresh is not None
     assert fresh.non_tensor_batch["input_pos"].tolist() == [10, 11]
+    assert current_input is not None
+    assert current_input.non_tensor_batch["input_pos"].tolist() == [100, 101, 10, 11]
+    assert current_input.non_tensor_batch["uid"].tolist() == ["carry-0", "carry-1", "uid-0", "uid-1"]
+    assert current_input.batch["dummy_tensor"].squeeze(-1).tolist() == [100, 101, 10, 11]
     assert source.next_fresh_quota(4) == 4
+
+
+def test_data_source_uses_reserved_lookahead_input_rows_for_carryover_current_batch():
+    source = AsyncSkdDataSource(_BatchIterator([_batch_dict(0, 4)]), uid_fn=_UidFactory())
+
+    reserved_0 = source.reserve_lookahead(logical_step=1)
+    reserved_1 = source.reserve_lookahead(logical_step=1)
+    assert reserved_0 is not None and reserved_1 is not None
+
+    source.record_carryover([_partial("uid-0"), _partial("uid-1")])
+
+    carryover, fresh, current_input = source.next_current_batch(base_batch_size=4)
+
+    assert [partial.sample_id for partial in carryover] == ["uid-0", "uid-1"]
+    assert fresh is not None
+    assert fresh.non_tensor_batch["input_pos"].tolist() == [2, 3]
+    assert current_input is not None
+    assert current_input.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
+    assert current_input.non_tensor_batch["uid"].tolist() == ["uid-0", "uid-1", "uid-2", "uid-3"]
 
 
 def test_data_source_reserves_lookahead_and_records_promoted_without_reducing_fresh_quota():
@@ -117,13 +149,18 @@ def test_data_source_reserves_lookahead_and_records_promoted_without_reducing_fr
     assert sample.non_tensor_batch["input_pos"].tolist() == [0]
 
     source.record_promoted([_completed(sample_id, sample)])
-    source.record_carryover([_partial("carry-0"), _partial("carry-1")])
+    source.record_carryover(
+        [_partial("carry-0"), _partial("carry-1")],
+        input_batches=[_single_input_row(100, "carry-0"), _single_input_row(101, "carry-1")],
+    )
 
     assert source.next_fresh_quota(4) == 2
-    carryover, fresh = source.next_current_batch(base_batch_size=4)
+    carryover, fresh, current_input = source.next_current_batch(base_batch_size=4)
     assert [partial.sample_id for partial in carryover] == ["carry-0", "carry-1"]
     assert fresh is not None
     assert fresh.non_tensor_batch["input_pos"].tolist() == [1, 2]
+    assert current_input is not None
+    assert current_input.non_tensor_batch["input_pos"].tolist() == [100, 101, 1, 2]
     assert sample_id in source.trained_reserved_sample_ids
 
 
@@ -132,7 +169,7 @@ def test_data_source_state_dict_restores_fresh_buffer_and_ledgers():
     first = source.pop_fresh_sample()
     assert first is not None
     source.record_promoted([_completed("uid-0", first)])
-    source.record_carryover([_partial("carry-0")])
+    source.record_carryover([_partial("carry-0")], input_batches=[_single_input_row(100, "carry-0")])
 
     restored = AsyncSkdDataSource(_BatchIterator([]), uid_fn=_UidFactory())
     restored.load_state_dict(source.state_dict())
@@ -140,5 +177,11 @@ def test_data_source_state_dict_restores_fresh_buffer_and_ledgers():
     next_sample = restored.pop_fresh_sample()
     assert next_sample is not None
     assert next_sample.non_tensor_batch["input_pos"].tolist() == [1]
-    assert restored.pop_carryover().sample_id == "carry-0"
     assert restored.trained_reserved_sample_ids == {"uid-0"}
+
+    carryover, fresh, current_input = restored.next_current_batch(base_batch_size=2)
+    assert [partial.sample_id for partial in carryover] == ["carry-0"]
+    assert fresh is not None
+    assert fresh.non_tensor_batch["input_pos"].tolist() == [2]
+    assert current_input is not None
+    assert current_input.non_tensor_batch["input_pos"].tolist() == [100, 2]

@@ -886,7 +886,7 @@ MVP 책임:
 pop_fresh_sample()
 reserve_lookahead(logical_step)
 record_promoted(samples)
-record_carryover(partials)
+record_carryover(partials, input_batches=None)
 next_current_batch(base_batch_size)
 next_fresh_quota(base_batch_size)
 state_dict()
@@ -909,6 +909,8 @@ MVP `state_dict()`는 source-local state만 저장한다.
 fresh_buffer
 fresh_cursor
 carryover_partials
+carryover_input_batches
+reserved_input_batches
 trained_reserved_sample_ids
 ```
 
@@ -987,6 +989,17 @@ rollout.n -> must be 1
 ```
 
 이 메서드는 next-step current work를 닫기 위한 중간 API다. 즉 `carryover 30 + fresh 66`을 모두 terminal completed `DataProto`로 만든다. Promoted lookahead까지 붙이는 trainer-level dynamic batch assembly는 이후 단계에서 처리한다.
+
+Source assembly contract:
+
+```text
+AsyncSkdDataSource.next_current_batch(B)
+  -> carryover_partials
+  -> fresh_batch
+  -> current_input_batch
+```
+
+`current_input_batch`는 carry-over input rows first, fresh rows after 순서다. 이 순서는 `generate_sequences_with_carryover()`의 output order와 동일해야 한다. Trainer는 이후 `current_input_batch.union(gen_batch_output)`을 수행하므로 row 수와 uid 순서가 맞아야 한다.
 
 ## 12. Phase 9: Trainer Integration
 

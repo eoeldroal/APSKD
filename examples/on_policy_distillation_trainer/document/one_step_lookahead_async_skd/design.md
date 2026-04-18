@@ -710,6 +710,8 @@ MVP `state_dict()`는 source-local state만 저장한다.
 fresh_buffer
 fresh_cursor
 carryover_partials
+carryover_input_batches
+reserved_input_batches
 trained_reserved_sample_ids
 ```
 
