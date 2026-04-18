@@ -1046,7 +1046,7 @@ Core files:
 
 - `verl/experimental/agent_loop/skd_agent_loop.py`
 - `verl/experimental/agent_loop/agent_loop.py`
-- `verl/trainer/ppo/ray_trainer.py` only if later data-source/checkpoint integration needs a small hook
+- `verl/trainer/ppo/ray_trainer.py` for batch acquisition, promoted input assembly, source checkpoint hooks, and metric handoff
 - `verl/workers/config/distillation.py`
 
 New async SKD files:
@@ -1054,7 +1054,7 @@ New async SKD files:
 - `verl/experimental/async_skd/state.py`
 - `verl/experimental/async_skd/worker.py`
 - `verl/experimental/async_skd/manager.py`
-- `verl/experimental/async_skd/data_source.py` later, when future samples must come from `StatefulDataLoader`
+- `verl/experimental/async_skd/data_source.py`
 
 Reference files to mimic, not blindly copy:
 
@@ -1068,6 +1068,49 @@ Experiment files:
 - `examples/on_policy_distillation_trainer/run_*fully_async*skd*.sh`
 - `examples/on_policy_distillation_trainer/document/one_step_lookahead_async_skd/design.md`
 - `examples/on_policy_distillation_trainer/document/one_step_lookahead_async_skd/implementation_plan.md`
+
+### 9.1.1 Reuse And Inheritance Decisions
+
+The implementation should reuse existing verl boundaries, but should not inherit from unrelated async trainers.
+
+Already adopted inheritance:
+
+```text
+AsyncSkdAgentLoopWorker(AgentLoopWorker)
+AsyncSkdAgentLoopManager(AgentLoopManager)
+```
+
+This is the correct inheritance boundary. `AgentLoopWorker` already owns agent-loop instantiation, server manager access, tokenizer/processor state, reward loop handles, teacher server handles, trace config, and postprocess logic. `AgentLoopManager` already owns rollout server initialization, worker creation, teacher wake/sleep, `DataProto.concat`, and timing aggregation. Async SKD should keep using these hooks.
+
+Do not add new inheritance from:
+
+```text
+FullyAsyncAgentLoopManager
+FullyAsyncRollouter
+FullyAsyncTrainer
+recipe/gkd/megatron/ray_trainer.py trainer classes
+```
+
+Reasons:
+
+- `FullyAsyncAgentLoopManager` rejects distillation-enabled use and its partial rollout is abort/resume based, not SKD committed-unit based.
+- `FullyAsyncRollouter` and `FullyAsyncTrainer` assume a producer/consumer queue split. The current bounded lookahead path is manager-local.
+- `MessageQueue` drops the oldest sample when full. SKD sample accounting cannot silently drop reserved or carry-over samples.
+- GKD trainer implements batch pipeline overlap. This design needs intra-step sample-level tail filling.
+- GKD Megatron workers are useful for rollout-only worker and weight sync reference code, but not as parent classes for the agent-loop SKD manager.
+
+Reuse map:
+
+| Remaining work | Reuse mechanism | Do not use |
+|---|---|---|
+| Promoted dynamic batch assembly | `DataProto.concat`, `DataProto.union`, `AsyncSkdDataSource` reservation ledger | new trainer subclass |
+| Carry-over current work scheduling | existing `AsyncSkdAgentLoopManager` task loop | `FullyAsyncRollouter` queue |
+| Stale budget enforcement | `_can_continue_lookahead_partial()` hook | new scheduler class |
+| Checkpoint integration | `RayPPOTrainer._save_checkpoint()` and `_load_checkpoint()` hooks | separate checkpoint engine |
+| Source-aware metrics | `DataProto.meta_info`, existing trainer metrics dict | `FullyAsync` metric names copied verbatim |
+| Persistent rollout weight sync | GKD `sync_rollout_weights()` as reference | GKD trainer inheritance |
+
+The next implementation priority is not another subclass. It is closing trainer input/output row accounting for promoted samples. When lookahead returns `B + Delta_k` generation rows, trainer input batch must also contain `B + Delta_k` input rows before `DataProto.union()`.
 
 ### 9.2 New Config Keys
 
@@ -1582,6 +1625,17 @@ If tool output depends on external state, replay/resume semantics can become les
 
 Snapshotting full agent state can be expensive. Compact representation should avoid dense full teacher tensors where possible.
 
+### 12.6 Promoted Input/Output Row Mismatch
+
+Finished lookahead promotion changes train output size from `B` to `B + Delta_k`. `DataProto.union()` requires the input batch and generated output batch to have identical row counts. Therefore promoted generation outputs cannot be appended alone. The source layer must also return the corresponding promoted input rows, and trainer batch assembly must concatenate:
+
+```text
+train_input_batch = base_input_batch + promoted_input_batch
+train_gen_output = base_gen_output + promoted_gen_output
+```
+
+The row order of these two concatenations must match exactly. Otherwise `uid`, reward metadata, teacher metadata, and generated tensors can be paired with the wrong sample.
+
 ## 13. Recommended MVP
 
 MVP should be conservative.
@@ -1607,6 +1661,20 @@ Scope:
 - No IS correction
 - No mid-tool interruption
 - No live KV cache resume
+
+Implementation priority after the current MVP state:
+
+```text
+1. promoted input batch assembly
+2. stale budget enforcement
+3. lookahead admission while completing carry-over + fresh current work
+4. source checkpoint integration
+5. source-aware metrics
+6. config schema
+7. persistent rollout/trainer split and weight sync
+```
+
+This order keeps row accounting correct before adding more concurrency.
 
 ## 14. Paper Framing
 

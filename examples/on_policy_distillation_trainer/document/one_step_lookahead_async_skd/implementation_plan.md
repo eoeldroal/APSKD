@@ -154,6 +154,50 @@ Do not copy directly:
 - existing partial rollout은 abort/resume 중심이고, SKD는 committed-unit-boundary pause가 필요하다.
 - 현재 구현 단계에서는 Ray actor queue를 만들지 않는다. Manager 내부 task set과 local state로 충분하다.
 
+### 2.4 Reuse And Inheritance Map
+
+Use inheritance only at the agent-loop boundary:
+
+```text
+AsyncSkdAgentLoopWorker(AgentLoopWorker)
+AsyncSkdAgentLoopManager(AgentLoopManager)
+```
+
+Do not introduce new parent classes for the trainer, source, or queue in the MVP. Existing verl code already exposes enough hooks:
+
+| Remaining work | Reuse mechanism | New class needed? |
+|---|---|---|
+| Promoted dynamic batch assembly | `AsyncSkdDataSource` plus `DataProto.concat` | no |
+| Carry-over current work scheduling | generalize current `AsyncSkdAgentLoopManager` task loop | no |
+| Stale budget enforcement | fill `_can_continue_lookahead_partial()` | no |
+| Checkpoint integration | extend `RayPPOTrainer._save_checkpoint()` and `_load_checkpoint()` | no |
+| Source-aware metrics | attach values to `DataProto.meta_info` and trainer `metrics` | no |
+| Config schema | add fields under distillation config | no |
+| Persistent rollout/trainer split | use GKD weight-sync code as reference | later, maybe |
+
+Do not inherit from:
+
+```text
+FullyAsyncAgentLoopManager
+FullyAsyncRollouter
+FullyAsyncTrainer
+recipe/gkd/megatron/ray_trainer.py trainer classes
+```
+
+Reasons:
+
+- `FullyAsyncAgentLoopManager` rejects distillation-enabled execution.
+- `FullyAsyncRollouter` and `FullyAsyncTrainer` are queue-based producer/consumer components. Bounded async SKD currently runs inside one manager-local rollout step.
+- `MessageQueue` drops samples when full. Bounded async SKD requires explicit promoted/carry-over/drop accounting.
+- GKD performs batch pipeline overlap. Bounded async SKD performs intra-step sample-level tail filling.
+
+Reference code should be copied only as small patterns:
+
+- `asyncio.wait(..., FIRST_COMPLETED)` active-task handling from `fully_async_policy`.
+- metric aggregation ideas from `fully_async_policy/detach_utils.py`.
+- rollout-only worker and `sync_rollout_weights()` mechanics from `recipe/gkd/megatron`.
+- checkpoint save/load location from `RayPPOTrainer`.
+
 ## 3. New Files
 
 새 경로를 만든다.
@@ -1061,32 +1105,171 @@ current_input_batch.union(gen_batch_output)
 
 Dynamic batch size `B + promoted_count`가 생기는 시점에는 reward/advantage/update path가 실제 token mask 기준으로 normalize되는지 별도 검증한다.
 
-## 13. Phase 10: Persistent Rollout Weight Sync
+### 12.1 Promoted Dynamic Batch Assembly
 
-목표: trainer update 후 student rollout engine에 weight를 sync한다.
+This is the next required implementation step before adding more lookahead concurrency.
 
-주의: MVP에서 per-sample committed-boundary sync를 가정하지 않는다. vLLM/SGLang weight update는 engine-level operation일 수 있으므로, 처음에는 다음 중 안전한 정책을 사용한다.
+Problem:
 
 ```text
-1. step boundary drain 후 sync
-2. 새 sample admission부터 새 version worker에 배정
-3. active old-version lookahead는 version_lag <= 1 안에서만 carryover 허용
+lookahead manager output = base_gen_output + promoted_gen_output
+trainer current input batch = base_input_batch
+DataProto.union() requires equal row count
 ```
 
-기록해야 할 metadata:
+Therefore promoted output cannot be returned without the matching promoted input rows.
+
+Required source API:
+
+```python
+class AsyncSkdDataSource:
+    def record_promoted(self, samples: list[AsyncSkdSample]) -> None:
+        ...
+
+    def pop_promoted_input_batches(self) -> list[DataProto]:
+        ...
+```
+
+Required manager behavior:
+
+```text
+completed lookahead -> keep AsyncSkdSample envelope
+source.record_promoted(promoted_samples)
+manager returns base outputs + promoted outputs
+```
+
+Required trainer behavior:
+
+```text
+base_input_batch = batch from _iter_training_batches()
+promoted_input_batch = source.pop_promoted_input_batches()
+if promoted_input_batch:
+    batch = DataProto.concat([base_input_batch, promoted_input_batch])
+batch = batch.repeat(...)
+batch = batch.union(gen_batch_output)
+```
+
+Ordering invariant:
+
+```text
+input rows:  base inputs, promoted inputs
+output rows: base outputs, promoted outputs
+```
+
+The source must preserve promoted input order using the same admission order used by manager output ordering.
+
+Tests:
+
+```text
+tests/skd/test_async_skd_data_source.py
+  - record_promoted stores promoted input rows in output order
+  - pop_promoted_input_batches returns and clears rows
+
+tests/trainer/ppo/test_ray_trainer_async_skd_helpers_on_cpu.py
+  - trainer assembles B + Delta input rows before union
+  - legacy dataloader-only path is unchanged
+```
+
+## 13. Phase 10: Remaining Manager And Trainer Closure
+
+목표: persistent rollout/trainer split에 들어가기 전에 현재 manager-local lookahead path의 row accounting, staleness cap, checkpoint, and repeated step behavior를 닫는다.
+
+### 13.1 Stale Budget Enforcement
+
+대상:
+
+```text
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Use existing hook:
+
+```text
+_can_continue_lookahead_partial(partial_state)
+```
+
+Do not create a new scheduler class for this. The required fields already live in `SkdPartialState`:
 
 ```text
 rollout_min_version
 rollout_max_version
-train_consume_version
-version_lag
-version_span
+committed_gen_chunks
+committed_env_units
+committed_prefix_tokens
 ```
 
-왜 필요한가:
+The predicate must enforce:
 
-- `version_lag <= 1`을 검증한다.
-- Drift metric과 benchmark 해석의 기준이 된다.
+```text
+committed_gen_chunks <= max_old_gen_chunks
+committed_env_units <= max_old_env_units
+committed_prefix_tokens <= old_prefix_token_cap
+version_span <= max_version_span
+version_lag <= max_version_lag
+```
+
+### 13.2 Lookahead Admission During Carry-Over Current Work
+
+대상:
+
+```text
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+`generate_sequences_with_carryover()` should reuse the same task-loop structure as `_generate_sequences_lookahead()`. Do not copy the whole function. Extract or generalize the common loop so current work can contain:
+
+```text
+fresh base samples
+resumed carry-over samples
+```
+
+The current-work output order remains:
+
+```text
+carry-over completed first
+fresh completed second
+promoted lookahead appended after current work
+```
+
+### 13.3 Source Checkpoint Integration
+
+대상:
+
+```text
+verl/trainer/ppo/ray_trainer.py
+tests/trainer/ppo/test_ray_trainer_async_skd_helpers_on_cpu.py
+```
+
+Extend existing `RayPPOTrainer._save_checkpoint()` and `_load_checkpoint()`. Do not add a separate checkpoint engine.
+
+New `data.pt` format:
+
+```python
+{
+    "train_dataloader": train_dataloader_state,
+    "async_skd_source": async_skd_source_state,
+}
+```
+
+Loader must support legacy format:
+
+```text
+legacy data.pt == train_dataloader_state
+```
+
+The checkpoint must preserve:
+
+```text
+fresh_buffer
+fresh_cursor
+reserved_input_batches
+trained_reserved_sample_ids
+carryover_partials
+carryover_input_batches
+promoted input rows if present
+```
 
 ## 14. Phase 11: Drift and Source-Aware Metrics
 
@@ -1184,7 +1367,44 @@ class DistillationConfig:
 - 이 기능은 일반 PPO async가 아니라 SKD semantics에 묶여 있다.
 - Teacher row alignment, SKD chunk, top-k teacher target과 직접 연결된다.
 
-## 16. Recommended Patch Order
+## 16. Phase 13: Persistent Rollout Weight Sync
+
+목표: trainer update 후 student rollout engine에 weight를 sync한다.
+
+주의: MVP에서 per-sample committed-boundary sync를 가정하지 않는다. vLLM/SGLang weight update는 engine-level operation일 수 있으므로, 처음에는 다음 중 안전한 정책을 사용한다.
+
+```text
+1. step boundary drain 후 sync
+2. 새 sample admission부터 새 version worker에 배정
+3. active old-version lookahead는 version_lag <= 1 안에서만 carryover 허용
+```
+
+기록해야 할 metadata:
+
+```text
+rollout_min_version
+rollout_max_version
+train_consume_version
+version_lag
+version_span
+```
+
+왜 필요한가:
+
+- `version_lag <= 1`을 검증한다.
+- Drift metric과 benchmark 해석의 기준이 된다.
+
+Reference:
+
+```text
+recipe/gkd/megatron/ray_trainer.py::sync_rollout_weights()
+recipe/gkd/megatron/megatron_workers.py::sync_rollout_weights()
+verl/experimental/fully_async_policy/fully_async_trainer.py::_fit_update_weights()
+```
+
+Do not inherit the GKD trainer. Copy only the weight-sync mechanics and version metadata pattern.
+
+## 17. Recommended Patch Order
 
 한 번에 크게 바꾸지 않는다.
 
@@ -1350,7 +1570,137 @@ Expected behavior:
 - next fresh quota is `B - carryover_count`.
 - promoted samples are tracked in the source ledger for duplicate prevention, not subtracted from next-step fresh quota.
 
-### Patch 9: Persistent Weight Sync
+### Patch 9: Promoted Dynamic Batch Assembly
+
+Files:
+
+```text
+verl/experimental/async_skd/data_source.py
+verl/experimental/async_skd/manager.py
+verl/trainer/ppo/ray_trainer.py
+tests/skd/test_async_skd_data_source.py
+tests/trainer/ppo/test_ray_trainer_async_skd_helpers_on_cpu.py
+```
+
+Changes:
+
+- store promoted input rows when lookahead samples complete.
+- expose a source method that returns promoted input rows once, in promoted output order.
+- assemble trainer input as `base_input + promoted_input` before `DataProto.union()`.
+- keep `fresh_quota = B - carryover_count`; promoted rows are not subtracted from next-step fresh quota.
+
+Expected behavior:
+
+- if manager returns `B + Delta` generation outputs, trainer input batch also has `B + Delta` rows.
+- `DataProto.union()` sees matching row counts.
+- promoted sample `uid` appears exactly once in training.
+
+### Patch 10: Stale Budget Enforcement
+
+Files:
+
+```text
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Changes:
+
+- implement `_can_continue_lookahead_partial()`.
+- read `max_old_gen_chunks`, `max_old_env_units`, `old_prefix_token_ratio`, `max_version_lag`, and `max_version_span`.
+- carry over or drop partials that exceed budget instead of continuing old-version rollout.
+
+Expected behavior:
+
+- lookahead partials do not keep advancing indefinitely while base LT is still running.
+- stale prefix size is bounded before resume.
+
+### Patch 11: Lookahead Admission During Carry-Over Current Work
+
+Files:
+
+```text
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Changes:
+
+- generalize current task loop so current work can be either base fresh samples or resumed carry-over samples.
+- allow `generate_sequences_with_carryover()` to admit lookahead while carry-over + fresh current work is active.
+- preserve current output order as carry-over completed first, fresh completed second.
+- append promoted outputs after current outputs.
+
+Expected behavior:
+
+- every step can perform bounded tail filling, including steps that start with carry-over.
+- current work still completes before train update.
+
+### Patch 12: Source Checkpoint Integration
+
+Files:
+
+```text
+verl/trainer/ppo/ray_trainer.py
+tests/trainer/ppo/test_ray_trainer_async_skd_helpers_on_cpu.py
+```
+
+Changes:
+
+- save `train_dataloader.state_dict()` and `AsyncSkdDataSource.state_dict()` together.
+- load both when lookahead mode is enabled.
+- support legacy `data.pt` files that contain only dataloader state.
+
+Expected behavior:
+
+- resume preserves fresh cursor, reserved input rows, promoted ledger, carry-over partials, and carry-over input rows.
+- legacy checkpoint loading still works.
+
+### Patch 13: Source-Aware Metrics
+
+Files:
+
+```text
+verl/experimental/async_skd/manager.py
+verl/experimental/async_skd/state.py
+verl/trainer/ppo/ray_trainer.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Changes:
+
+- add promoted/carry-over/drop counts.
+- add stale prefix counters from `SkdPartialState`.
+- add version lag/span counters when version metadata exists.
+- place metrics in `DataProto.meta_info` or trainer `metrics` without changing train tensors.
+
+Expected behavior:
+
+- training logs can separate base current, promoted lookahead, and resumed carry-over samples.
+- benchmark claims can be tied to observed staleness and drift proxies.
+
+### Patch 14: Config Schema
+
+Files:
+
+```text
+verl/workers/config/distillation.py
+verl/trainer/config/distillation/distillation.yaml
+examples/on_policy_distillation_trainer/run_*skd*.sh
+```
+
+Changes:
+
+- add async SKD lookahead config fields.
+- keep ad hoc config keys as backward-compatible aliases only if needed.
+- validate `rollout.n == 1`, REMAX disabled, rollout skip disabled, and curriculum sampler disabled.
+
+Expected behavior:
+
+- experiment scripts can enable lookahead through explicit config fields.
+- stale budget values are no longer hard-coded in manager methods.
+
+### Patch 15: Persistent Weight Sync
 
 Changes:
 
@@ -1363,7 +1713,17 @@ Expected behavior:
 - `version_lag <= 1`.
 - `version_span <= 1`.
 
-### Patch 10: Drift Metrics
+Reference:
+
+```text
+recipe/gkd/megatron/ray_trainer.py::sync_rollout_weights()
+recipe/gkd/megatron/megatron_workers.py::sync_rollout_weights()
+verl/experimental/fully_async_policy/fully_async_trainer.py::_fit_update_weights()
+```
+
+Do not inherit the GKD trainer. Copy only the weight-sync mechanics and version metadata pattern.
+
+### Patch 16: Drift Metrics
 
 Changes:
 
@@ -1375,7 +1735,7 @@ Expected behavior:
 
 - 논문 방어용 diagnostics 수집 가능.
 
-## 17. Step-by-Step Validation Gates
+## 18. Step-by-Step Validation Gates
 
 각 patch마다 최소 확인해야 하는 항목이다.
 
@@ -1447,7 +1807,7 @@ source_type별 response length
 source_type별 tool call count
 ```
 
-## 18. Expected First Implementation Scope
+## 19. Expected First Implementation Scope
 
 첫 구현은 conservative하게 잡는다.
 
@@ -1472,7 +1832,7 @@ Feature scope:
 - No mid-tool interruption.
 - No live KV cache resume.
 
-## 19. Core Rationale
+## 20. Core Rationale
 
 이 구현은 GPU를 항상 100% 쓰는 fully streaming 시스템이 아니다. 정확한 목표는 다음이다.
 
