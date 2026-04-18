@@ -1228,7 +1228,84 @@ fresh completed second
 promoted lookahead appended after current work
 ```
 
-### 13.3 Source Checkpoint Integration
+### 13.3 Worker-Slot Refill Scheduling
+
+대상:
+
+```text
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Current state:
+
+```text
+base_active: dict[Task, int]
+lookahead_active: dict[Task, int]
+lookahead worker assignment: round-robin
+```
+
+Replace with worker-aware bookkeeping:
+
+```python
+base_active: dict[asyncio.Task, tuple[int, int]]
+lookahead_active: dict[asyncio.Task, tuple[int, int]]
+worker_active_counts: list[int]
+worker_capacity = ceil(current_work_count / len(agent_loop_workers))
+```
+
+Tuple meaning:
+
+```text
+(output_or_admission_order, worker_idx)
+```
+
+Admission rule:
+
+```python
+def try_admit_lookahead(worker_idx: int) -> None:
+    if drain_requested:
+        return
+    if lookahead_started_count >= prefetch_limit:
+        return
+    if worker_active_counts[worker_idx] >= worker_capacity:
+        return
+    next_item = source.reserve_lookahead(logical_step)
+    if next_item is None:
+        return
+    launch_lookahead_on_worker(worker_idx, next_item)
+```
+
+Completion rule:
+
+```text
+when a base/current task completes:
+  decrement that worker's active count
+  try_admit_lookahead(worker_idx)
+
+when a lookahead task completes:
+  decrement that worker's active count
+  if partial can continue before drain:
+    relaunch partial on the same worker_idx
+```
+
+Why worker-level first:
+
+- `generate_sequence_single()` already exposes sample-level completion events.
+- The manager currently knows worker handles, not exact CUDA device ids.
+- SGLang batches individual outstanding requests internally.
+- Under TP=1, one SGLang server replica usually maps to one GPU, but manager should not rely on CUDA numbers.
+
+Tests:
+
+```text
+fast worker receives more lookahead admissions than slow worker
+worker_active_counts never exceeds worker_capacity
+global prefetch limit still caps total lookahead starts
+drain_requested stops new admissions even if worker slots become free
+```
+
+### 13.4 Source Checkpoint Integration
 
 대상:
 
@@ -1629,7 +1706,54 @@ Expected behavior:
 - every step can perform bounded tail filling, including steps that start with carry-over.
 - current work still completes before train update.
 
-### Patch 12: Source Checkpoint Integration
+### Patch 12: Worker-Slot Refill Lookahead
+
+Files:
+
+```text
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Changes:
+
+- replace round-robin lookahead worker assignment with same-worker slot refill.
+- store `worker_idx` in active task bookkeeping.
+- maintain `worker_active_counts`.
+- derive `worker_capacity = ceil(current_work_count / num_workers)` unless config overrides it.
+- call `try_admit_lookahead(worker_idx)` when a current task frees a slot.
+
+Expected behavior:
+
+- fast workers naturally admit more lookahead work.
+- no worker exceeds its active request capacity.
+- global prefetch limit remains the upper bound on lookahead starts.
+- `drain_requested=True` prevents any new lookahead admission.
+
+### Patch 13: Server-Replica Observability
+
+Files:
+
+```text
+verl/experimental/agent_loop/agent_loop.py
+verl/workers/rollout/sglang_rollout/async_sglang_server.py
+verl/experimental/async_skd/manager.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Changes:
+
+- record acquired `server_id` in `TokenOutput.extra_fields`, e.g. `rollout_server_id`.
+- log or expose worker_idx to rollout_server_id distribution in async SKD metrics.
+- do not add preferred-server routing yet.
+
+Expected behavior:
+
+- scheduler can report which server replicas actually handled work.
+- worker-level refill can be evaluated against server-replica distribution.
+- no change to routing semantics.
+
+### Patch 14: Source Checkpoint Integration
 
 Files:
 
@@ -1649,7 +1773,7 @@ Expected behavior:
 - resume preserves fresh cursor, reserved input rows, promoted ledger, carry-over partials, and carry-over input rows.
 - legacy checkpoint loading still works.
 
-### Patch 13: Source-Aware Metrics
+### Patch 15: Source-Aware Metrics
 
 Files:
 
@@ -1672,7 +1796,7 @@ Expected behavior:
 - training logs can separate base current, promoted lookahead, and resumed carry-over samples.
 - benchmark claims can be tied to observed staleness and drift proxies.
 
-### Patch 14: Config Schema
+### Patch 16: Config Schema
 
 Files:
 
@@ -1693,7 +1817,7 @@ Expected behavior:
 - experiment scripts can enable lookahead through explicit config fields.
 - stale budget values are no longer hard-coded in manager methods.
 
-### Patch 15: Persistent Weight Sync
+### Patch 17: Persistent Weight Sync
 
 Changes:
 
@@ -1716,7 +1840,26 @@ verl/experimental/fully_async_policy/fully_async_trainer.py::_fit_update_weights
 
 Do not inherit the GKD trainer. Copy only the weight-sync mechanics and version metadata pattern.
 
-### Patch 16: Drift Metrics
+### Patch 18: Preferred Server Routing
+
+Files:
+
+```text
+verl/experimental/agent_loop/agent_loop.py
+tests/skd/test_async_skd_manager_lookahead.py
+```
+
+Changes:
+
+- add optional preferred server id support only if server-replica metrics show worker-level refill is insufficient.
+- extend load balancer or `AsyncLLMServerManager.generate()` with a controlled preferred-server path.
+
+Expected behavior:
+
+- lookahead can target a specific SGLang server replica.
+- default routing remains unchanged when no preferred server is provided.
+
+### Patch 19: Drift Metrics
 
 Changes:
 

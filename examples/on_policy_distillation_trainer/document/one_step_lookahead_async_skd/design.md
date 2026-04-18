@@ -1544,7 +1544,7 @@ EOS 있음 + no valid tool call + no interaction:
 
 ```text
 STEP_ROLLOUT_ACTIVE
-  -> LOOKAHEAD_ADMISSION
+  -> SLOT_REFILL_LOOKAHEAD_ADMISSION
   -> BARRIER_DRAIN
   -> TRAIN_UPDATE
   -> NEXT_STEP_ASSEMBLE
@@ -1556,10 +1556,48 @@ State meanings:
 | State | Meaning |
 |---|---|
 | `STEP_ROLLOUT_ACTIVE` | Base batch rollout is running |
-| `LOOKAHEAD_ADMISSION` | Idle pair starts bounded future samples |
+| `SLOT_REFILL_LOOKAHEAD_ADMISSION` | A worker request slot becomes free and admits bounded future work |
 | `BARRIER_DRAIN` | Current LT finishes, lookahead tasks stop at next exportable handler-return boundary |
 | `TRAIN_UPDATE` | Train on base + promoted samples |
 | `NEXT_STEP_ASSEMBLE` | Build next step from carry-over + fresh quota |
+
+### 10.6 Worker-Slot Refill Policy
+
+verl sends one SGLang request per sample. It does not send the worker chunk as one batched tensor request. SGLang performs continuous batching internally over outstanding requests. Therefore lookahead scheduling should control the number of in-flight sample requests, not a tensor batch.
+
+Initial policy:
+
+```text
+worker_capacity = ceil(base_batch_size / num_agent_loop_workers)
+worker_active_count[worker_idx] = current samples + lookahead samples assigned to that worker
+```
+
+When a current-step sample finishes:
+
+```text
+1. decrement worker_active_count[worker_idx].
+2. if drain_requested is false and global prefetch budget remains:
+   reserve one lookahead sample.
+3. launch that lookahead sample on the same worker_idx.
+4. increment worker_active_count[worker_idx].
+```
+
+This is worker-replica aware, not exact GPU-number aware. Exact CUDA device id is not needed for the first implementation. Under TP=1 and one SGLang server per replica, worker/server-replica identity is the useful scheduling unit.
+
+Server-replica observability should be added before server-directed routing:
+
+```text
+AsyncLLMServerManager.generate records rollout_server_id in TokenOutput.extra_fields.
+Manager logs worker_idx -> rollout_server_id distribution.
+```
+
+Do not add preferred-server routing in the first pass. If metrics show worker-level refill does not correlate with server-replica load, then add a later API:
+
+```python
+server_manager.generate(..., preferred_server_id="sglang_server_2_0")
+```
+
+That later API requires load-balancer changes and should be separate from worker-slot refill.
 
 ## 11. Invariants
 
@@ -1587,6 +1625,8 @@ teacher row = dummy row
 - No sample with age greater than 1 enters training.
 - Step-level batch size may be dynamic.
 - Current-step work size is preserved by `fresh_quota = B - carryover_count`; promoted samples increase throughput.
+- Lookahead admission is bounded by both global prefetch budget and per-worker active request capacity.
+- A free worker slot may be filled only before `drain_requested=True`.
 
 ### 11.3 Atomicity Invariants
 
@@ -1770,6 +1810,16 @@ SKD async path에서는 다음이 필요하다.
 - tool macro-step atomicity
 - `version_lag <= 1` hard cap
 - `k+2` 이상 prefetch 금지
+
+For the current manager-local design, reuse only the active-task pattern:
+
+```text
+asyncio.wait(..., return_when=FIRST_COMPLETED)
+task -> worker_idx bookkeeping
+worker_active_count-based refill
+```
+
+Do not import the queue design. `MessageQueue` drops samples when full, which conflicts with source ledger accounting.
 
 ### 15.3 Persistent Instance Interpretation
 
