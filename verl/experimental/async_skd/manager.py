@@ -9,6 +9,7 @@ from omegaconf import OmegaConf
 import ray
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
 from verl.utils.ray_utils import auto_await
@@ -31,21 +32,27 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         mode = self._async_skd_mode()
         if mode in {"sync", "disabled", "none"}:
             return await super().generate_sequences(prompts)
-        if mode != "sample_async":
+        if mode not in {"sample_async", "lookahead"}:
             raise ValueError(f"Unsupported async SKD rollout mode: {mode!r}")
 
         rollout_n = self._rollout_n()
         if rollout_n != 1:
-            raise ValueError(f"Async SKD sample_async currently requires rollout.n == 1, got {rollout_n}")
+            raise ValueError(f"Async SKD {mode} currently requires rollout.n == 1, got {rollout_n}")
 
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.wake_up()
         try:
-            outputs = await self._generate_sequences_sample_async(prompts)
+            if mode == "lookahead":
+                outputs = await self._generate_sequences_lookahead(prompts)
+            else:
+                outputs = await self._generate_sequences_sample_async(prompts)
         finally:
             if self.stream_teacher_with_rollout:
                 await self.teacher_model_manager.sleep()
 
+        return self._finalize_outputs(outputs)
+
+    def _finalize_outputs(self, outputs: list[DataProto]) -> DataProto:
         output = DataProto.concat(outputs)
         metrics = [single.meta_info.pop("metrics") for single in outputs]
         timing = self._performance_metrics(metrics, output)
@@ -63,6 +70,26 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         if value is None:
             value = getattr(self.rollout_config, "n", 1)
         return int(value)
+
+    def _lookahead_prefetch_limit(self, batch_size: int) -> int:
+        value = OmegaConf.select(
+            self.config,
+            "actor_rollout_ref.rollout.agent.async_skd_prefetch_limit",
+            default=0,
+        )
+        return max(0, min(int(value), batch_size))
+
+    def _next_lookahead_sample(self, logical_step: int) -> tuple[str, DataProto] | None:
+        del logical_step
+        return None
+
+    def _can_continue_lookahead_partial(self, partial_state: SkdPartialState) -> bool:
+        del partial_state
+        return True
+
+    def _next_fresh_quota(self, base_batch_size: int) -> int:
+        carryover_count = len(getattr(self, "_async_skd_carryover_partials", []))
+        return max(0, base_batch_size - carryover_count)
 
     async def _generate_sequences_sample_async(self, prompts: DataProto) -> list[DataProto]:
         """Run all base samples concurrently and collect by FIRST_COMPLETED.
@@ -103,3 +130,119 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 outputs[pos] = await task
 
         return [output for output in outputs if output is not None]
+
+    async def _generate_sequences_lookahead(self, prompts: DataProto) -> list[DataProto]:
+        """Run base samples while opportunistically filling freed slots with bounded lookahead."""
+        if len(prompts) == 0:
+            return []
+        if not self.agent_loop_workers:
+            raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
+
+        base_completed: list[DataProto | None] = [None] * len(prompts)
+        promoted_lookahead: list[tuple[int, DataProto]] = []
+        carryover_partials: list[tuple[int, SkdPartialState]] = []
+        base_active: dict[asyncio.Task, int] = {}
+        lookahead_active: dict[asyncio.Task, int] = {}
+        prefetch_limit = self._lookahead_prefetch_limit(len(prompts))
+        lookahead_started_count = 0
+        lookahead_launch_count = 0
+        drain_requested = False
+        logical_step = int(prompts.meta_info.get("global_steps", 0)) + 1
+
+        def worker_for_pos(pos: int) -> Any:
+            worker_idx = min(pos * len(self.agent_loop_workers) // len(prompts), len(self.agent_loop_workers) - 1)
+            return self.agent_loop_workers[worker_idx]
+
+        def worker_for_lookahead() -> Any:
+            nonlocal lookahead_launch_count
+            worker = self.agent_loop_workers[lookahead_launch_count % len(self.agent_loop_workers)]
+            lookahead_launch_count += 1
+            return worker
+
+        def launch_base(pos: int) -> None:
+            worker = worker_for_pos(pos)
+            sample = prompts[pos : pos + 1]
+            task = asyncio.ensure_future(worker.generate_sequence_single.remote(sample))
+            base_active[task] = pos
+
+        def launch_lookahead_batch(sample_id: str, sample: DataProto, admission_order: int) -> None:
+            worker = worker_for_lookahead()
+            task = asyncio.ensure_future(
+                worker.generate_skd_until_boundary.remote(
+                    sample,
+                    sample_id=sample_id,
+                    logical_step=logical_step,
+                    source_type="lookahead",
+                )
+            )
+            lookahead_active[task] = admission_order
+
+        def launch_lookahead_partial(partial_state: SkdPartialState, admission_order: int) -> None:
+            worker = worker_for_lookahead()
+            task = asyncio.ensure_future(
+                worker.generate_skd_until_boundary.remote(
+                    None,
+                    partial_state=partial_state,
+                    sample_id=partial_state.sample_id,
+                    logical_step=partial_state.logical_step,
+                    source_type=partial_state.source_type,
+                )
+            )
+            lookahead_active[task] = admission_order
+
+        def try_admit_lookahead() -> None:
+            nonlocal lookahead_started_count
+            if drain_requested or not base_active or lookahead_started_count >= prefetch_limit:
+                return
+            next_item = self._next_lookahead_sample(logical_step)
+            if next_item is None:
+                return
+            sample_id, sample = next_item
+            admission_order = lookahead_started_count
+            lookahead_started_count += 1
+            launch_lookahead_batch(sample_id, sample, admission_order)
+
+        for pos in range(len(prompts)):
+            launch_base(pos)
+
+        while base_active or lookahead_active:
+            done, _ = await asyncio.wait(
+                set(base_active.keys()) | set(lookahead_active.keys()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in done:
+                if task in base_active:
+                    pos = base_active.pop(task)
+                    base_completed[pos] = await task
+                    if not base_active:
+                        drain_requested = True
+                    try_admit_lookahead()
+
+            for task in done:
+                if task in lookahead_active:
+                    admission_order = lookahead_active.pop(task)
+                    sample: AsyncSkdSample = await task
+                    sample.validate()
+                    if sample.kind == "completed":
+                        promoted_lookahead.append((admission_order, sample.require_completed()))
+                        continue
+
+                    partial = sample.require_partial()
+                    if (
+                        not drain_requested
+                        and bool(base_active)
+                        and self._can_continue_lookahead_partial(partial)
+                    ):
+                        launch_lookahead_partial(partial, admission_order)
+                    else:
+                        carryover_partials.append((admission_order, partial))
+
+            if not drain_requested:
+                try_admit_lookahead()
+
+        self._async_skd_carryover_partials = [
+            partial for _, partial in sorted(carryover_partials, key=lambda item: item[0])
+        ]
+        promoted_outputs = [batch for _, batch in sorted(promoted_lookahead, key=lambda item: item[0])]
+        return [output for output in base_completed if output is not None] + promoted_outputs

@@ -767,13 +767,33 @@ verl/experimental/async_skd/manager.py
 필수 state:
 
 ```text
-base_active_tasks
-lookahead_active_tasks
-base_completed
-promoted_lookahead
-carryover_partials
-lookahead_started_count
-drain_requested
+base_active: dict[asyncio.Task, int]
+lookahead_active: dict[asyncio.Task, int]
+base_completed: list[DataProto | None]
+promoted_lookahead: list[DataProto]
+carryover_partials: list[SkdPartialState]
+lookahead_started_count: int
+drain_requested: bool
+```
+
+새 `LookaheadTaskState` dataclass는 만들지 않는다. Active task는 아직 sample payload가 아니므로 `asyncio.Task` 자체로 추적한다. Base task에는 original input order 복원을 위해 position `int`만 붙인다. Lookahead task에는 promoted/carryover order 보존을 위한 admission order `int`만 붙인다. Sample metadata는 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState` 안에 이미 존재한다.
+
+Manager-local scheduler가 새로 도입하지 말아야 할 타입:
+
+```text
+LookaheadTaskState
+SkdCompletedSample
+SkdSampleSource enum
+LookaheadResult
+CarryoverSample
+PromotedSample
+```
+
+결과 payload는 기존 envelope만 사용한다.
+
+```text
+completed result -> AsyncSkdSample(kind="completed", batch=DataProto)
+partial result -> AsyncSkdSample(kind="partial", partial_state=SkdPartialState)
 ```
 
 흐름:
@@ -807,7 +827,7 @@ lookahead target step = current_step + 1
 lookahead_started_count <= L_prefetch
 budget is not refilled within the same step
 drain_requested == False
-base_active_tasks > 0
+base_active is not empty
 future source has next sample
 ```
 
@@ -1077,6 +1097,7 @@ Changes:
 - `SkdPartialState`
 - `AsyncSkdSample`
 - `SkdCommittedUnit`
+- avoid `LookaheadTaskState`; manager active task bookkeeping uses `asyncio.Task` collections
 - remove/avoid `SkdCompletedSample`
 - remove/avoid `SkdSampleSource` enum; validate `source_type` strings in `AsyncSkdSample.validate()`
 

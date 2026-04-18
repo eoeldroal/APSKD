@@ -1078,7 +1078,7 @@ old_prefix_token_cap = max_response_length * old_prefix_token_ratio
 
 ### 9.3 Per-Sample Type Discipline
 
-구현 타입은 최소화한다. Manager-local scheduler가 직접 다루는 top-level type은 `AsyncSkdSample` 하나로 둔다.
+구현 타입은 최소화한다. Manager-local scheduler가 결과 payload로 직접 다루는 top-level type은 `AsyncSkdSample` 하나로 둔다. Active task bookkeeping은 payload가 아니므로 별도 dataclass를 만들지 않고 `asyncio.Task` 기반 collection으로 처리한다.
 
 ```text
 SkdCommittedUnit:
@@ -1093,6 +1093,18 @@ AsyncSkdSample:
 ```
 
 Completed sample의 실체는 `DataProto`다. Partial sample의 실체는 `SkdPartialState`다. 둘을 각각 별도 completed/partial wrapper로 늘리지 않는다.
+
+Manager 내부 task bookkeeping은 다음 정도로 충분하다.
+
+```python
+base_active: dict[asyncio.Task, int]
+lookahead_active: dict[asyncio.Task, int]
+base_completed: list[DataProto | None]
+promoted_lookahead: list[DataProto]
+carryover_partials: list[SkdPartialState]
+```
+
+새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`은 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState`에 이미 있다. `lookahead_active`의 값은 promoted/carryover order 보존을 위한 admission order `int`뿐이다. `worker`는 launch 시점에만 필요하고, 첫 구현에서는 partial continuation을 같은 worker에 고정하지 않는다.
 
 ```python
 @dataclass
@@ -1507,12 +1519,13 @@ These fields must survive manager-local scheduling and, later, checkpoint serial
 
 ### 11.5 Unified Envelope Invariants
 
-- Manager-local active/completed/carryover collections store only `AsyncSkdSample`.
+- Manager-local active collections store `asyncio.Task`, not custom task-state dataclasses.
+- Manager-local completed/carryover result handling uses only `AsyncSkdSample`, `DataProto`, and `SkdPartialState`.
 - The manager must call `sample.validate()` before storing.
 - A Ray actor queue should not be introduced unless producer and consumer become independent long-lived actors.
 - Trainer batch assembly uses only `sample.require_completed()`.
 - Resume path uses only `sample.require_partial()`.
-- `SkdSampleSource` and `SkdCompletedSample` should not be introduced; they duplicate envelope responsibilities.
+- `LookaheadTaskState`, `SkdSampleSource`, `SkdCompletedSample`, `LookaheadResult`, `CarryoverSample`, and `PromotedSample` should not be introduced; they duplicate existing envelope or manager-local collection responsibilities.
 
 ## 12. Risks
 
