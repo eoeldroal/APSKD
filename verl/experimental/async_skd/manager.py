@@ -140,42 +140,28 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         fresh_prompts: DataProto | None,
         carryover_partials: list[SkdPartialState],
     ) -> list[DataProto]:
-        if not self.agent_loop_workers:
-            raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
-
         fresh_count = len(fresh_prompts) if fresh_prompts is not None else 0
-        output_count = len(carryover_partials) + fresh_count
-        outputs: list[DataProto | None] = [None] * output_count
-        active: dict[asyncio.Task, int] = {}
-
-        def worker_for_order(order: int) -> Any:
-            return self.agent_loop_workers[order % len(self.agent_loop_workers)]
+        current_items: list[tuple[str, int, Any]] = []
 
         for pos, partial in enumerate(carryover_partials):
-            worker = worker_for_order(pos)
-            task = asyncio.ensure_future(worker.generate_skd_from_partial_to_completion.remote(partial))
-            active[task] = pos
+            current_items.append(("carryover", pos, partial))
 
         if fresh_prompts is not None:
             offset = len(carryover_partials)
             for pos in range(fresh_count):
-                worker = worker_for_order(offset + pos)
-                sample = fresh_prompts[pos : pos + 1]
-                task = asyncio.ensure_future(worker.generate_sequence_single.remote(sample))
-                active[task] = offset + pos
+                current_items.append(("fresh", offset + pos, fresh_prompts[pos : pos + 1]))
 
-        while active:
-            done, _ = await asyncio.wait(active.keys(), return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                order = active.pop(task)
-                result = await task
-                if isinstance(result, AsyncSkdSample):
-                    result.validate()
-                    outputs[order] = result.require_completed()
-                else:
-                    outputs[order] = result
-
-        return [output for output in outputs if output is not None]
+        logical_step = 0
+        if fresh_prompts is not None:
+            logical_step = int(fresh_prompts.meta_info.get("global_steps", 0)) + 1
+        elif carryover_partials:
+            logical_step = max(partial.logical_step for partial in carryover_partials)
+        prefetch_limit = self._lookahead_prefetch_limit(len(current_items))
+        return await self._generate_current_work_with_lookahead(
+            current_items,
+            logical_step=logical_step,
+            prefetch_limit=prefetch_limit,
+        )
 
     async def _generate_sequences_sample_async(self, prompts: DataProto) -> list[DataProto]:
         """Run all base samples concurrently and collect by FIRST_COMPLETED.
@@ -221,26 +207,44 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         """Run base samples while opportunistically filling freed slots with bounded lookahead."""
         if len(prompts) == 0:
             return []
+        current_items = [("fresh", pos, prompts[pos : pos + 1]) for pos in range(len(prompts))]
+        logical_step = int(prompts.meta_info.get("global_steps", 0)) + 1
+        prefetch_limit = self._lookahead_prefetch_limit(len(current_items))
+        return await self._generate_current_work_with_lookahead(
+            current_items,
+            logical_step=logical_step,
+            prefetch_limit=prefetch_limit,
+        )
+
+    async def _generate_current_work_with_lookahead(
+        self,
+        current_items: list[tuple[str, int, Any]],
+        *,
+        logical_step: int,
+        prefetch_limit: int,
+    ) -> list[DataProto]:
+        """Run current work and use freed worker slots for bounded lookahead."""
+        if not current_items:
+            return []
         if not self.agent_loop_workers:
             raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
 
-        base_completed: list[DataProto | None] = [None] * len(prompts)
+        current_count = len(current_items)
+        current_completed: list[DataProto | None] = [None] * current_count
         promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
         carryover_partials: list[tuple[int, SkdPartialState]] = []
-        base_active: dict[asyncio.Task, tuple[int, int]] = {}
+        current_active: dict[asyncio.Task, tuple[int, int]] = {}
         lookahead_active: dict[asyncio.Task, tuple[int, int]] = {}
-        prefetch_limit = self._lookahead_prefetch_limit(len(prompts))
         lookahead_started_count = 0
         drain_requested = False
-        logical_step = int(prompts.meta_info.get("global_steps", 0)) + 1
         num_workers = len(self.agent_loop_workers)
-        worker_capacity = max(1, math.ceil(len(prompts) / num_workers))
+        worker_capacity = max(1, math.ceil(current_count / num_workers))
         worker_active_counts = [0 for _ in range(num_workers)]
         worker_completed_counts = [0 for _ in range(num_workers)]
         worker_active_max = 0
 
-        def worker_idx_for_pos(pos: int) -> int:
-            return min(pos * num_workers // len(prompts), num_workers - 1)
+        def worker_idx_for_order(order: int) -> int:
+            return min(order * num_workers // current_count, num_workers - 1)
 
         def worker_for_idx(worker_idx: int) -> Any:
             return self.agent_loop_workers[worker_idx]
@@ -255,12 +259,16 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             if worker_active_counts[worker_idx] < 0:
                 raise RuntimeError(f"worker_active_counts[{worker_idx}] became negative")
 
-        def launch_base(pos: int) -> None:
-            worker_idx = worker_idx_for_pos(pos)
+        def launch_current(kind: str, order: int, payload: Any) -> None:
+            worker_idx = worker_idx_for_order(order)
             worker = worker_for_idx(worker_idx)
-            sample = prompts[pos : pos + 1]
-            task = asyncio.ensure_future(worker.generate_sequence_single.remote(sample))
-            base_active[task] = (pos, worker_idx)
+            if kind == "fresh":
+                task = asyncio.ensure_future(worker.generate_sequence_single.remote(payload))
+            elif kind == "carryover":
+                task = asyncio.ensure_future(worker.generate_skd_from_partial_to_completion.remote(payload))
+            else:
+                raise ValueError(f"Unsupported async SKD current work kind: {kind!r}")
+            current_active[task] = (order, worker_idx)
             note_launch(worker_idx)
 
         def launch_lookahead_batch(sample_id: str, sample: DataProto, admission_order: int, worker_idx: int) -> None:
@@ -292,7 +300,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
 
         def try_admit_lookahead(worker_idx: int) -> None:
             nonlocal lookahead_started_count
-            if drain_requested or not base_active or lookahead_started_count >= prefetch_limit:
+            if drain_requested or not current_active or lookahead_started_count >= prefetch_limit:
                 return
             if worker_active_counts[worker_idx] >= worker_capacity:
                 return
@@ -304,22 +312,27 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             lookahead_started_count += 1
             launch_lookahead_batch(sample_id, sample, admission_order, worker_idx)
 
-        for pos in range(len(prompts)):
-            launch_base(pos)
+        for kind, order, payload in current_items:
+            launch_current(kind, order, payload)
 
-        while base_active or lookahead_active:
+        while current_active or lookahead_active:
             done, _ = await asyncio.wait(
-                set(base_active.keys()) | set(lookahead_active.keys()),
+                set(current_active.keys()) | set(lookahead_active.keys()),
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
             for task in done:
-                if task in base_active:
-                    pos, worker_idx = base_active.pop(task)
+                if task in current_active:
+                    order, worker_idx = current_active.pop(task)
                     note_finish(worker_idx)
-                    base_completed[pos] = await task
+                    result = await task
+                    if isinstance(result, AsyncSkdSample):
+                        result.validate()
+                        current_completed[order] = result.require_completed()
+                    else:
+                        current_completed[order] = result
                     worker_completed_counts[worker_idx] += 1
-                    if not base_active:
+                    if not current_active:
                         drain_requested = True
                     try_admit_lookahead(worker_idx)
 
@@ -339,7 +352,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     partial = sample.require_partial()
                     if (
                         not drain_requested
-                        and bool(base_active)
+                        and bool(current_active)
                         and self._can_continue_lookahead_partial(partial)
                     ):
                         launch_lookahead_partial(partial, admission_order, worker_idx)
@@ -365,4 +378,4 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             source.record_carryover(self._async_skd_carryover_partials)
 
         promoted_outputs = [sample.require_completed() for sample in self._async_skd_last_promoted_samples]
-        return [output for output in base_completed if output is not None] + promoted_outputs
+        return [output for output in current_completed if output is not None] + promoted_outputs

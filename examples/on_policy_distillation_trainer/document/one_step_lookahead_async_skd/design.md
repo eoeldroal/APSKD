@@ -1211,14 +1211,14 @@ Completed sample의 실체는 `DataProto`다. Partial sample의 실체는 `SkdPa
 Manager 내부 task bookkeeping은 다음 정도로 충분하다.
 
 ```python
-base_active: dict[asyncio.Task, int]
-lookahead_active: dict[asyncio.Task, int]
-base_completed: list[DataProto | None]
-promoted_lookahead: list[AsyncSkdSample]
-carryover_partials: list[SkdPartialState]
+current_active: dict[asyncio.Task, tuple[int, int]]
+lookahead_active: dict[asyncio.Task, tuple[int, int]]
+current_completed: list[DataProto | None]
+promoted_lookahead: list[tuple[int, AsyncSkdSample]]
+carryover_partials: list[tuple[int, SkdPartialState]]
 ```
 
-새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`은 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState`에 이미 있다. `lookahead_active`의 값은 promoted/carryover order 보존을 위한 admission order `int`뿐이다. `worker`는 launch 시점에만 필요하고, 첫 구현에서는 partial continuation을 같은 worker에 고정하지 않는다. Completed lookahead도 최종 `DataProto` 반환 직전까지 `AsyncSkdSample` envelope로 보존한다. 그래야 `source.record_promoted(...)`가 `sample_id`를 잃지 않는다.
+새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`은 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState`에 이미 있다. Active task 값은 `(output_or_admission_order, worker_idx)` tuple이면 충분하다. Completed lookahead도 최종 `DataProto` 반환 직전까지 `AsyncSkdSample` envelope로 보존한다. 그래야 `source.record_promoted(...)`가 `sample_id`를 잃지 않는다.
 
 ```python
 @dataclass
@@ -1376,7 +1376,7 @@ Current-step manager assembly:
 generate_sequences_with_carryover(fresh_prompts, carryover_partials) -> DataProto
 ```
 
-This path completes carry-over samples first and fresh samples second. It does not admit new lookahead samples yet; it only closes the next-step current work contract.
+This path completes carry-over samples first and fresh samples second. It uses the same worker-slot refill scheduler as the base lookahead path, so carry-over + fresh current work can admit bounded next-step lookahead while current work is still active.
 
 Trainer:
 

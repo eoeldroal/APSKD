@@ -828,16 +828,16 @@ verl/experimental/async_skd/manager.py
 필수 state:
 
 ```text
-base_active: dict[asyncio.Task, int]
-lookahead_active: dict[asyncio.Task, int]
-base_completed: list[DataProto | None]
-promoted_lookahead: list[AsyncSkdSample]
-carryover_partials: list[SkdPartialState]
+current_active: dict[asyncio.Task, tuple[int, int]]
+lookahead_active: dict[asyncio.Task, tuple[int, int]]
+current_completed: list[DataProto | None]
+promoted_lookahead: list[tuple[int, AsyncSkdSample]]
+carryover_partials: list[tuple[int, SkdPartialState]]
 lookahead_started_count: int
 drain_requested: bool
 ```
 
-새 `LookaheadTaskState` dataclass는 만들지 않는다. Active task는 아직 sample payload가 아니므로 `asyncio.Task` 자체로 추적한다. Base task에는 original input order 복원을 위해 position `int`만 붙인다. Lookahead task에는 promoted/carryover order 보존을 위한 admission order `int`만 붙인다. Sample metadata는 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState` 안에 이미 존재한다.
+새 `LookaheadTaskState` dataclass는 만들지 않는다. Active task는 아직 sample payload가 아니므로 `asyncio.Task` 자체로 추적한다. Current task에는 output order와 worker slot accounting을 위해 `(order, worker_idx)`만 붙인다. Lookahead task에는 promoted/carryover order와 same-worker continuation을 위해 `(admission_order, worker_idx)`만 붙인다. Sample metadata는 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState` 안에 이미 존재한다.
 
 Manager-local scheduler가 새로 도입하지 말아야 할 타입:
 
@@ -1226,6 +1226,12 @@ The current-work output order remains:
 carry-over completed first
 fresh completed second
 promoted lookahead appended after current work
+```
+
+Implementation status:
+
+```text
+implemented through AsyncSkdAgentLoopManager._generate_current_work_with_lookahead()
 ```
 
 ### 13.3 Worker-Slot Refill Scheduling
@@ -1688,6 +1694,8 @@ Expected behavior:
 - stale prefix size is bounded before resume.
 
 ### Patch 11: Lookahead Admission During Carry-Over Current Work
+
+Status: implemented.
 
 Files:
 
