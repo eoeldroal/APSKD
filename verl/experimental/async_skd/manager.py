@@ -26,6 +26,13 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.agent_loop_workers_class = ray.remote(AsyncSkdAgentLoopWorker)
+        self._async_skd_data_source = None
+
+    def set_async_skd_data_source(self, source: Any | None) -> None:
+        self._async_skd_data_source = source
+
+    def _get_async_skd_data_source(self) -> Any | None:
+        return getattr(self, "_async_skd_data_source", None)
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -80,16 +87,90 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         return max(0, min(int(value), batch_size))
 
     def _next_lookahead_sample(self, logical_step: int) -> tuple[str, DataProto] | None:
-        del logical_step
-        return None
+        source = self._get_async_skd_data_source()
+        if source is None:
+            return None
+        return source.reserve_lookahead(logical_step)
 
     def _can_continue_lookahead_partial(self, partial_state: SkdPartialState) -> bool:
         del partial_state
         return True
 
     def _next_fresh_quota(self, base_batch_size: int) -> int:
+        source = self._get_async_skd_data_source()
+        if source is not None:
+            return int(source.next_fresh_quota(base_batch_size))
         carryover_count = len(getattr(self, "_async_skd_carryover_partials", []))
         return max(0, base_batch_size - carryover_count)
+
+    @auto_await
+    async def generate_sequences_with_carryover(
+        self,
+        *,
+        fresh_prompts: DataProto | None,
+        carryover_partials: list[SkdPartialState],
+    ) -> DataProto:
+        rollout_n = self._rollout_n()
+        if rollout_n != 1:
+            raise ValueError(f"Async SKD carryover currently requires rollout.n == 1, got {rollout_n}")
+
+        if fresh_prompts is None and not carryover_partials:
+            raise ValueError("generate_sequences_with_carryover requires fresh_prompts or carryover_partials")
+
+        if fresh_prompts is not None and len(fresh_prompts) == 0:
+            fresh_prompts = None
+
+        if self.stream_teacher_with_rollout:
+            await self.teacher_model_manager.wake_up()
+        try:
+            outputs = await self._generate_sequences_with_carryover(fresh_prompts, carryover_partials)
+        finally:
+            if self.stream_teacher_with_rollout:
+                await self.teacher_model_manager.sleep()
+
+        return self._finalize_outputs(outputs)
+
+    async def _generate_sequences_with_carryover(
+        self,
+        fresh_prompts: DataProto | None,
+        carryover_partials: list[SkdPartialState],
+    ) -> list[DataProto]:
+        if not self.agent_loop_workers:
+            raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
+
+        fresh_count = len(fresh_prompts) if fresh_prompts is not None else 0
+        output_count = len(carryover_partials) + fresh_count
+        outputs: list[DataProto | None] = [None] * output_count
+        active: dict[asyncio.Task, int] = {}
+
+        def worker_for_order(order: int) -> Any:
+            return self.agent_loop_workers[order % len(self.agent_loop_workers)]
+
+        for pos, partial in enumerate(carryover_partials):
+            worker = worker_for_order(pos)
+            task = asyncio.ensure_future(worker.generate_skd_from_partial_to_completion.remote(partial))
+            active[task] = pos
+
+        if fresh_prompts is not None:
+            offset = len(carryover_partials)
+            for pos in range(fresh_count):
+                worker = worker_for_order(offset + pos)
+                sample = fresh_prompts[pos : pos + 1]
+                task = asyncio.ensure_future(worker.generate_sequence_single.remote(sample))
+                active[task] = offset + pos
+
+        while active:
+            done, _ = await asyncio.wait(active.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                order = active.pop(task)
+                result = await task
+                if isinstance(result, AsyncSkdSample):
+                    result.validate()
+                    outputs[order] = result.require_completed()
+                else:
+                    outputs[order] = result
+
+        return [output for output in outputs if output is not None]
 
     async def _generate_sequences_sample_async(self, prompts: DataProto) -> list[DataProto]:
         """Run all base samples concurrently and collect by FIRST_COMPLETED.
@@ -139,7 +220,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
 
         base_completed: list[DataProto | None] = [None] * len(prompts)
-        promoted_lookahead: list[tuple[int, DataProto]] = []
+        promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
         carryover_partials: list[tuple[int, SkdPartialState]] = []
         base_active: dict[asyncio.Task, int] = {}
         lookahead_active: dict[asyncio.Task, int] = {}
@@ -225,7 +306,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     sample: AsyncSkdSample = await task
                     sample.validate()
                     if sample.kind == "completed":
-                        promoted_lookahead.append((admission_order, sample.require_completed()))
+                        promoted_lookahead.append((admission_order, sample))
                         continue
 
                     partial = sample.require_partial()
@@ -241,8 +322,16 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             if not drain_requested:
                 try_admit_lookahead()
 
+        self._async_skd_last_promoted_samples = [
+            sample for _, sample in sorted(promoted_lookahead, key=lambda item: item[0])
+        ]
         self._async_skd_carryover_partials = [
             partial for _, partial in sorted(carryover_partials, key=lambda item: item[0])
         ]
-        promoted_outputs = [batch for _, batch in sorted(promoted_lookahead, key=lambda item: item[0])]
+        source = self._get_async_skd_data_source()
+        if source is not None:
+            source.record_promoted(self._async_skd_last_promoted_samples)
+            source.record_carryover(self._async_skd_carryover_partials)
+
+        promoted_outputs = [sample.require_completed() for sample in self._async_skd_last_promoted_samples]
         return [output for output in base_completed if output is not None] + promoted_outputs

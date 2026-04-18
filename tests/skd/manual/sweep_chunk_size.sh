@@ -5,14 +5,14 @@
 # 사전 조건: launch_test_servers.sh로 서버가 이미 떠 있어야 함.
 #
 # Usage:
-#   bash tests/skd/sweep_chunk_size.sh
+#   bash tests/skd/manual/sweep_chunk_size.sh
 
 set -euo pipefail
 
 cd /home/work/DDAI_revised/OSworld/verl
 
 PYTHON="/home/work/DDAI_revised/miniconda3/envs/kd/bin/python"
-TEST_SCRIPT="tests/skd/test_skd_integration.py"
+TEST_SCRIPT="tests/skd/manual/skd_integration_manual.py"
 
 VERIFY_TOP_K=3
 MAX_RESPONSE=4096

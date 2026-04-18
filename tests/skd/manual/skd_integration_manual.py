@@ -2,11 +2,11 @@
 Speculative Knowledge Distillation (SKD) 통합 테스트.
 
 실제 vLLM HTTP 서버 (Student + Teacher)를 사용하여 SKD 로직을 검증한다.
-서버를 먼저 띄운 뒤 실행: bash tests/skd/launch_test_servers.sh
+서버를 먼저 띄운 뒤 실행: bash tests/skd/manual/launch_test_servers.sh
 
 Usage:
-    python tests/skd/test_skd_integration.py
-    python tests/skd/test_skd_integration.py --chunk-size 512 --verify-top-k 25
+    python tests/skd/manual/skd_integration_manual.py
+    python tests/skd/manual/skd_integration_manual.py --chunk-size 512 --verify-top-k 25
 """
 
 import argparse
@@ -391,7 +391,7 @@ async def run_test(args):
             print(f"  Student ({STUDENT_URL}): OK")
         except Exception as e:
             print(f"  Student ({STUDENT_URL}): FAIL — {e}")
-            print("  서버를 먼저 띄워주세요: bash tests/skd/launch_test_servers.sh")
+            print("  서버를 먼저 띄워주세요: bash tests/skd/manual/launch_test_servers.sh")
             return
         try:
             r = await client.get(f"{TEACHER_URL}/health")

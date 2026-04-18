@@ -83,7 +83,13 @@ worker.generate_sequence_single(sample) x 24:
 
 이 single-sample primitive는 base `AgentLoopWorker`가 아니라 `AsyncSkdAgentLoopWorker(AgentLoopWorker)`에 둔다. `AgentLoopWorker`는 기존 generic batch path를 유지하고, SKD async 전용 primitive는 별도 worker subclass에 격리한다.
 
-`AsyncSkdAgentLoopWorker` exposes two execution primitives. `generate_sequence_single()` fully completes a single base sample and returns `DataProto`. `generate_skd_until_boundary()` advances a fresh or resumed SKD sample until `TERMINATED` or the next exportable committed-unit boundary and returns `AsyncSkdSample`.
+`AsyncSkdAgentLoopWorker` exposes three execution primitives. `generate_sequence_single()` fully completes a single fresh base sample and returns `DataProto`. `generate_skd_until_boundary()` advances a fresh or resumed SKD sample until `TERMINATED` or the next exportable committed-unit boundary and returns `AsyncSkdSample`. `generate_skd_from_partial_to_completion()` resumes a carry-over `SkdPartialState` as current-step work and runs it to terminal completion.
+
+이 세 primitive의 근본적인 차이는 **약속의 유무**다.
+
+`generate_skd_until_boundary()`가 처리하는 lookahead sample은 아직 current batch에 포함되지 않은 투기적(speculative) 실행이다. step barrier 전에 완료되면 promoted, 완료되지 못하면 pause → carryover로 넘어간다. 약속이 없으므로 pause가 허용된다.
+
+`generate_skd_from_partial_to_completion()`이 처리하는 carry-over sample은 `next_current_batch()`가 반환한 순간 current batch에 편입된다. Trainer는 이 step에서 B개를 학습한다는 전제로 동작하므로, 편입된 sample이 또 pause되면 실제 학습 샘플 수가 B보다 적어지고 배치 예산 불변식이 깨진다. 따라서 current batch에 편입된 carry-over는 **이번 step에서 반드시 완료하거나 drop**한다. `version_lag <= 1` hard cap은 이 철학의 기술적 결과다. carry-over가 step k+1에서 또 pause되면 step k+2에서 `version_lag = 2`가 되어 제약을 위반한다.
 
 Lookahead는 이 sample-level completion visibility 위에 붙인다. Base batch가 끝나면 `drain_requested=True`가 되고, active lookahead task는 강제 cancel하지 않는다. 대신 `skd_agent_loop.py`가 제공하는 cooperative boundary return을 사용한다.
 
@@ -672,9 +678,9 @@ for batch_dict in self.train_dataloader:
     batch = DataProto.from_single_dict(batch_dict)
 ```
 
-Bounded lookahead에서는 이 구조 위에 sample-level reservation 계층이 필요하다. 이유는 step `k` 중에 step `k+1` sample 일부를 미리 reserve해야 하고, 그중 finished promoted sample과 unfinished carry-over sample만큼 step `k+1`의 fresh sample 소비량을 줄여야 하기 때문이다.
+Bounded lookahead에서는 이 구조 위에 sample-level reservation 계층이 필요하다. 이유는 step `k` 중에 step `k+1` sample 일부를 미리 reserve해야 하고, 그중 unfinished carry-over sample만큼 step `k+1`의 fresh sample 소비량을 줄여야 하기 때문이다. Finished promoted sample은 next-step fresh quota에서 차감하지 않는다. 대신 source/reservation ledger가 해당 sample을 다시 emit하지 않도록 중복 방지 대상으로 기록한다.
 
-첫 구현에서는 PyTorch sampler 자체를 바꾸지 않는다. 또한 전체 dataset이나 dataloader output을 `list()`로 materialize하지 않는다. 현재 `AsyncSkdSampleProvider(samples=list(...))` 형태는 accounting prototype으로만 취급하고, production lookahead path는 dataloader-aware source로 별도 구현한다.
+첫 구현에서는 PyTorch sampler 자체를 바꾸지 않는다. 또한 전체 dataset이나 dataloader output을 `list()`로 materialize하지 않는다. 초기 list-materialized accounting prototype은 현재 quota 규칙과 실제 dataloader contract에 맞지 않아 제거했고, production lookahead path는 dataloader-aware source로 구현한다.
 
 ```text
 StatefulDataLoader / existing sampler
@@ -696,7 +702,20 @@ AsyncSkdDataSource:
 
 이렇게 해야 기존 sampler의 checkpoint/resume, curriculum sampler update, distributed shuffle semantics를 크게 건드리지 않고 async SKD 전용 sample accounting을 추가할 수 있다. MVP에서는 curriculum sampler가 켜져 있으면 lookahead를 비활성화하고, `rollout.n != 1`이면 lookahead path를 거부한다.
 
-Sample provider가 지켜야 할 핵심 불변식은 다음이다.
+현재 구현된 MVP `AsyncSkdDataSource`는 `StatefulDataLoader` 자체를 바꾸지 않는다. Dataloader iterator가 반환한 collated `batch_dict`를 `DataProto.from_single_dict(batch_dict)`로 변환한 뒤, 내부 fresh buffer에서 `DataProto[pos:pos+1]` 형태로 single-sample `DataProto`를 공급한다. Source가 부여한 `uid`는 lookahead reservation, promoted ledger, carry-over accounting의 sample identity로 사용한다.
+
+MVP `state_dict()`는 source-local state만 저장한다.
+
+```text
+fresh_buffer
+fresh_cursor
+carryover_partials
+trained_reserved_sample_ids
+```
+
+`StatefulDataLoader.state_dict()`와 source state를 같은 trainer checkpoint에 묶는 작업은 trainer integration 단계에서 수행한다.
+
+`AsyncSkdDataSource`와 trainer integration이 지켜야 할 핵심 불변식은 다음이다.
 
 ```text
 1. 동일 sample은 active window 안에서 중복 소비되지 않는다.
@@ -704,7 +723,7 @@ Sample provider가 지켜야 할 핵심 불변식은 다음이다.
 3. step 중 lookahead budget은 refill하지 않는다.
 4. promoted sample은 source/reservation ledger에서 중복 방지 대상으로 기록한다.
 5. carry-over sample은 next-step fresh quota에서 차감한다.
-6. provider state는 checkpoint 가능해야 한다.
+6. source-local state는 `StatefulDataLoader` state와 함께 checkpoint 가능해야 한다.
 ```
 
 따라서 mixed batch 구성은 단순히 tensor를 concat하는 문제가 아니다. 그 전에 “어떤 fresh sample을 얼마나 새로 꺼낼지”를 결정하는 reservation layer가 필요하다.
@@ -717,7 +736,7 @@ Sample provider가 지켜야 할 핵심 불변식은 다음이다.
 - Unfinished carry-over resume의 mismatch는 `max_old_gen_chunks * delta_k`로 상한이 있다.
 - `age > 1` sample을 drop하면 sample age는 hard cap 된다.
 - Tool result를 atomic unit으로 묶으면 mid-tool state corruption은 구조적으로 방지된다.
-- Promoted sample을 next-step quota에서 차감하면 two-step sample accounting은 보존된다.
+- `fresh_quota_{k+1} = B - R_k`로 두면 step `k+1` current work size는 `B`로 보존된다. Promoted `Delta_k`는 next-step fresh quota에서 차감하지 않고, source/reservation ledger에서 duplicate emission만 막는다.
 - `old_prefix_token_cap = max_response_length / 8`은 old prefix가 전체 response budget을 과도하게 잠식하는 것을 막는다.
 - 학습 loss의 student side는 항상 current trainer parameter로 forward되므로, stale rollout logprob가 gradient에 직접 들어가지 않는다.
 - SKD teacher correction은 committed assistant token을 teacher top-k tube 안으로 제한한다.
@@ -1100,11 +1119,11 @@ Manager 내부 task bookkeeping은 다음 정도로 충분하다.
 base_active: dict[asyncio.Task, int]
 lookahead_active: dict[asyncio.Task, int]
 base_completed: list[DataProto | None]
-promoted_lookahead: list[DataProto]
+promoted_lookahead: list[AsyncSkdSample]
 carryover_partials: list[SkdPartialState]
 ```
 
-새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`은 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState`에 이미 있다. `lookahead_active`의 값은 promoted/carryover order 보존을 위한 admission order `int`뿐이다. `worker`는 launch 시점에만 필요하고, 첫 구현에서는 partial continuation을 같은 worker에 고정하지 않는다.
+새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`은 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState`에 이미 있다. `lookahead_active`의 값은 promoted/carryover order 보존을 위한 admission order `int`뿐이다. `worker`는 launch 시점에만 필요하고, 첫 구현에서는 partial continuation을 같은 worker에 고정하지 않는다. Completed lookahead도 최종 `DataProto` 반환 직전까지 `AsyncSkdSample` envelope로 보존한다. 그래야 `source.record_promoted(...)`가 `sample_id`를 잃지 않는다.
 
 ```python
 @dataclass
@@ -1219,6 +1238,7 @@ restore_agent_state(snapshot) -> AgentData
 set_skd_last_committed_unit(agent_data, unit: str) -> None
 export_partial_state(agent_data, next_state) -> SkdPartialState
 restore_partial_state(partial_state) -> tuple[AgentData, AgentState]
+run_from_partial_to_completion(partial_state) -> AgentLoopOutput
 ```
 
 SKD:
@@ -1236,12 +1256,21 @@ Rollouter:
 try_admit_lookahead_sample()
 within_old_budget(sample, next_unit, cfg)
 run_lookahead_until_pause_or_finish(sample, version, cfg, drain_flag)
+run_carryover_until_completion(partial_state, current_version)
 drain_all_lookaheads_to_safe_point()
 collect_finished_and_paused_lookaheads()
 promote_finished_samples()
 request_weight_sync(version)
 apply_weight_sync_at_safe_point(worker_id, version)
 ```
+
+Current-step manager assembly:
+
+```python
+generate_sequences_with_carryover(fresh_prompts, carryover_partials) -> DataProto
+```
+
+This path completes carry-over samples first and fresh samples second. It does not admit new lookahead samples yet; it only closes the next-step current work contract.
 
 Trainer:
 

@@ -645,6 +645,69 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
 
 
 @pytest.mark.asyncio
+async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediate_boundary():
+    partial = SkdPartialState(
+        sample_id="resume-to-completion",
+        logical_step=13,
+        source_type="lookahead",
+        agent_state=AgentState.GENERATING.value,
+        last_committed_unit="ASSISTANT_GEN_CHUNK",
+        request_id="req-resume-to-completion",
+        tools_kwargs={},
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=[1, 2, 3, 10],
+        teacher_prompt_ids=[1, 2, 3, 10],
+        response_ids=[10],
+        response_mask=[1],
+        response_logprobs=[],
+        assistant_turns=0,
+        user_turns=0,
+        rollout_birth_version=7,
+        rollout_min_version=7,
+        rollout_max_version=7,
+        committed_gen_chunks=1,
+        committed_env_units=0,
+        committed_prefix_tokens=1,
+        metrics={},
+        extra_fields={
+            "teacher_prompt_ids": [1, 2, 3, 10],
+            "teacher_ids_list": [[10, 0, 0, 0]],
+            "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
+            "skd_last_committed_unit": "ASSISTANT_GEN_CHUNK",
+            "skd_pending_turn_response_ids": [10],
+            "skd_committed_gen_chunks": 1,
+            "skd_committed_env_units": 0,
+            "skd_committed_prefix_tokens": 1,
+            "rollout_birth_version": 7,
+            "rollout_min_version": 7,
+            "rollout_max_version": 7,
+            "raw_prompt": [{"role": "user", "content": "question"}],
+        },
+    )
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [20],
+            [30, EOS],
+        ],
+        teacher_topk_by_call=[
+            {},
+            {},
+        ],
+    )
+
+    result = await loop.run_from_partial_to_completion({}, partial_state=partial)
+
+    assert isinstance(result, AgentLoopOutput)
+    assert result.prompt_ids == [1, 2, 3]
+    assert result.response_ids == [10, 20, 30, EOS]
+    assert result.response_mask == [1, 1, 1, 1]
+    assert loop.server_manager.call_count == 2
+    assert result.extra_fields["skd_termination_reason"] == "eos"
+    assert "skd_pending_turn_response_ids" not in result.extra_fields
+
+
+@pytest.mark.asyncio
 async def test_skd_generating_state_handles_budget_exhausted_before_first_chunk():
     loop = make_skd_loop(student_chunks=[], response_length=1)
     agent_data = make_agent_data([1, 2, 3])

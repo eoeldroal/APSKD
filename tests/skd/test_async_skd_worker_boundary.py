@@ -131,6 +131,23 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
 
         self.loop.run_until_exportable_boundary = MethodType(fake_run_until_exportable_boundary, self.loop)
 
+        async def fake_run_from_partial_to_completion(
+            loop_self,
+            sampling_params: dict[str, Any],
+            *,
+            partial_state: SkdPartialState,
+        ):
+            loop_self.calls.append(
+                {
+                    "sampling_params": sampling_params,
+                    "partial_state": partial_state,
+                    "completion": True,
+                }
+            )
+            return loop_result
+
+        self.loop.run_from_partial_to_completion = MethodType(fake_run_from_partial_to_completion, self.loop)
+
     def _get_or_create_agent_loop(self, agent_name: str):
         assert agent_name == "skd_agent"
         return self.loop
@@ -186,6 +203,32 @@ async def test_generate_skd_until_boundary_wraps_completed_result_from_partial_s
     assert batch.non_tensor_batch["reward_model"][0] == {"ground_truth": "42"}
     assert batch.batch["responses"].shape == (1, 4)
     assert worker.loop.calls[0]["partial_state"] is partial
+
+
+@pytest.mark.asyncio
+async def test_generate_skd_from_partial_to_completion_returns_completed_resumed_sample():
+    output = AgentLoopOutput(
+        prompt_ids=[1, 2, 3],
+        response_ids=[10, 20],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={"turn_scores": [], "tool_rewards": []},
+    )
+    partial = make_partial()
+    worker = _DummyWorker(output)
+
+    result = await worker.generate_skd_from_partial_to_completion(partial)
+
+    assert result.kind == "completed"
+    assert result.sample_id == "partial-sample"
+    assert result.logical_step == 12
+    assert result.source_type == "resumed_current"
+    batch = result.require_completed()
+    assert batch.non_tensor_batch["index"].tolist() == [7]
+    assert batch.non_tensor_batch["reward_model"][0] == {"ground_truth": "42"}
+    assert batch.batch["responses"].shape == (1, 4)
+    assert worker.loop.calls[0]["partial_state"] is partial
+    assert worker.loop.calls[0]["completion"] is True
 
 
 @pytest.mark.asyncio

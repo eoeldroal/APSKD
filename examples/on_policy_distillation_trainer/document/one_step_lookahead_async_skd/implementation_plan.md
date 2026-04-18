@@ -554,7 +554,9 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
 
 `AsyncSkdAgentLoopWorker`는 `AgentLoopWorker`를 상속한다. 기존 batch path의 핵심 helper는 재사용하되, async SKD 전용 primitive는 base `AgentLoopWorker`에 추가하지 않는다.
 
-`generate_skd_until_boundary()` is the only worker API that may return partial samples. `generate_sequence_single()` remains completed-only. This separation is intentional: base samples use the completed-only path, while lookahead/carryover samples use the boundary path.
+`generate_skd_until_boundary()` is the only worker API that may return partial samples. `generate_sequence_single()` remains completed-only. `generate_skd_from_partial_to_completion()` is also completed-only, but starts from `SkdPartialState` instead of fresh `DataProto`. This separation is intentional: fresh base samples use the single-sample completion path, lookahead samples use the boundary path, and next-step carry-over samples use the partial-to-completion path.
+
+**왜 carry-over는 반드시 완료해야 하는가.** Lookahead sample은 current batch에 포함되기 전의 투기적 실행이므로 pause가 허용된다. 반면 carry-over sample은 `next_current_batch()`가 반환한 시점에 current batch에 편입된다. Trainer는 이 step에서 B개를 학습한다는 전제로 동작하므로, carry-over가 또 pause되면 실제 학습 샘플 수가 B보다 적어지고 배치 예산 불변식이 깨진다. `version_lag <= 1` hard cap은 이 철학의 기술적 결과다. `generate_skd_from_partial_to_completion()`이 완료를 보증한다.
 
 ### 7.2 Move/Add `generate_sequence_single()`
 
@@ -598,7 +600,27 @@ async def generate_skd_until_boundary(...) -> AsyncSkdSample:
 
 이 함수는 SKD 전용이므로 base `AgentLoopWorker`에 두지 않는다.
 
-### 7.4 Compatibility Checks
+### 7.4 Add SKD Partial-To-Completion Primitive
+
+```python
+async def generate_skd_from_partial_to_completion(
+    partial_state: SkdPartialState,
+    *,
+    source_type: str = "resumed_current",
+) -> AsyncSkdSample:
+    ...
+```
+
+역할:
+
+- `SkdAgentLoop.run_from_partial_to_completion()`을 호출한다.
+- `_restore_partial_state()`로 복원한 뒤 `stop_after_committed_unit=False` 경로로 `TERMINATED`까지 진행한다.
+- 반환값은 항상 `AsyncSkdSample(kind="completed", source_type="resumed_current")`다.
+- 이 함수는 next-step current work에 들어온 carry-over sample용이다. Lookahead drain에는 사용하지 않는다.
+
+이 함수도 SKD 전용이므로 base `AgentLoopWorker`에 두지 않는다.
+
+### 7.5 Compatibility Checks
 
 - single-sample output key가 batch path와 같아야 한다.
 - `teacher_ids`, `teacher_logprobs`, `response_mask` shape가 기존과 맞아야 한다.
@@ -770,7 +792,7 @@ verl/experimental/async_skd/manager.py
 base_active: dict[asyncio.Task, int]
 lookahead_active: dict[asyncio.Task, int]
 base_completed: list[DataProto | None]
-promoted_lookahead: list[DataProto]
+promoted_lookahead: list[AsyncSkdSample]
 carryover_partials: list[SkdPartialState]
 lookahead_started_count: int
 drain_requested: bool
@@ -807,7 +829,7 @@ partial result -> AsyncSkdSample(kind="partial", partial_state=SkdPartialState)
 6. active lookahead tasks finish their current safe unit and return.
 7. completed lookahead -> promoted.
 8. partial lookahead -> carryover.
-9. train batch = base_completed + promoted_lookahead.
+9. train batch = base_completed + promoted_lookahead.require_completed().
 ```
 
 ### 10.1 Lookahead Admission Rule
@@ -854,7 +876,43 @@ drain 요청 후 추가로 허용되는 overshoot는 최대 하나의 committed 
 
 목표: lookahead admission이 사용할 step `k+1` sample을 기존 `StatefulDataLoader`/sampler/checkpoint semantics와 충돌하지 않게 공급한다.
 
-현재 `AsyncSkdSampleProvider(samples=list(...))`는 accounting prototype이다. 실제 production provider로 사용하지 않는다.
+초기 list-materialized accounting prototype은 제거했다. 해당 prototype은 전체 sample list를 메모리에 들고, promoted sample까지 next-step fresh quota에서 차감하는 오래된 규칙을 사용했기 때문에 실제 production source로 유지하지 않는다.
+
+현재 구현된 MVP는 `verl/experimental/async_skd/data_source.py`의 `AsyncSkdDataSource`다. 이 클래스는 `StatefulDataLoader`를 대체하지 않는다. Dataloader iterator에서 collated `batch_dict`를 하나씩 받아 `DataProto.from_single_dict(batch_dict)`로 fresh buffer를 만들고, `DataProto[pos:pos+1]` 방식으로 single-sample `DataProto`를 공급한다.
+
+MVP 책임:
+
+```text
+pop_fresh_sample()
+reserve_lookahead(logical_step)
+record_promoted(samples)
+record_carryover(partials)
+next_current_batch(base_batch_size)
+next_fresh_quota(base_batch_size)
+state_dict()
+load_state_dict(state)
+```
+
+Manager 결선:
+
+```text
+AsyncSkdAgentLoopManager.set_async_skd_data_source(source)
+_next_lookahead_sample(logical_step) -> source.reserve_lookahead(logical_step)
+completed lookahead -> keep AsyncSkdSample envelope until source.record_promoted(...)
+partial lookahead -> source.record_carryover(...)
+final train output -> base DataProto + promoted.require_completed()
+```
+
+MVP `state_dict()`는 source-local state만 저장한다.
+
+```text
+fresh_buffer
+fresh_cursor
+carryover_partials
+trained_reserved_sample_ids
+```
+
+`StatefulDataLoader.state_dict()`와 함께 checkpoint에 저장하고 복원하는 trainer integration은 아직 별도 단계다.
 
 실제 구현 방향:
 
@@ -870,7 +928,7 @@ Rule:
 
 - 전체 dataset이나 전체 dataloader output을 `list()`로 materialize하지 않는다.
 - `StatefulDataLoader.state_dict()`를 기존대로 존중한다.
-- provider checkpoint에는 dataloader state와 small active buffers만 저장한다.
+- trainer checkpoint에는 dataloader state와 source-local buffer state를 함께 저장한다. 현재 MVP source는 source-local buffer state만 제공한다.
 - curriculum sampler가 켜져 있으면 MVP에서는 lookahead를 비활성화한다.
 - `rollout.n != 1`이면 MVP에서는 async SKD lookahead path를 거부한다.
 
@@ -904,6 +962,31 @@ step k+1 current work = resume 30 + fresh 66 = 96
 ```
 
 `lookahead_started_count`는 step-local counter이며 step `k+1`에서 다시 0부터 시작한다.
+
+### 11.2 Manager Current-Work Assembly
+
+Trainer integration 전에 manager는 carry-over partial과 fresh prompts를 같은 current step work로 실행할 수 있어야 한다.
+
+```python
+async def generate_sequences_with_carryover(
+    *,
+    fresh_prompts: DataProto | None,
+    carryover_partials: list[SkdPartialState],
+) -> DataProto:
+    ...
+```
+
+초기 contract:
+
+```text
+carryover_partials -> generate_skd_from_partial_to_completion()
+fresh_prompts -> generate_sequence_single()
+output order -> carryover completed first, fresh completed after
+lookahead admission -> not enabled in this method yet
+rollout.n -> must be 1
+```
+
+이 메서드는 next-step current work를 닫기 위한 중간 API다. 즉 `carryover 30 + fresh 66`을 모두 terminal completed `DataProto`로 만든다. Promoted lookahead까지 붙이는 trainer-level dynamic batch assembly는 이후 단계에서 처리한다.
 
 ## 12. Phase 9: Trainer Integration
 

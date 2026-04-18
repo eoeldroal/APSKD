@@ -192,3 +192,40 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             source_type=source_type,
             batch=completed_batch,
         )
+
+    async def generate_skd_from_partial_to_completion(
+        self,
+        partial_state: SkdPartialState,
+        *,
+        source_type: str = "resumed_current",
+        agent_name: str = "skd_agent",
+    ) -> AsyncSkdSample:
+        """Resume an SKD partial as current-step work and run it to completion."""
+        input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
+        sampling_params = self._build_sampling_params(validate=False)
+        agent_loop = self._get_or_create_agent_loop(agent_name)
+        from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+
+        if not isinstance(agent_loop, SkdAgentLoop):
+            raise TypeError(
+                "generate_skd_from_partial_to_completion requires skd_agent loop, "
+                f"got {type(agent_loop).__name__} for agent_name={agent_name!r}"
+            )
+
+        result = await agent_loop.run_from_partial_to_completion(
+            sampling_params,
+            partial_state=partial_state,
+        )
+        postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
+        internal_output = await self._agent_loop_postprocess(result, False, **postprocess_kwargs)
+        completed_batch = self._postprocess(
+            [internal_output],
+            input_non_tensor_batch=input_non_tensor_batch,
+            validate=False,
+        )
+        return AsyncSkdSample.from_completed(
+            sample_id=partial_state.sample_id,
+            logical_step=partial_state.logical_step,
+            source_type=source_type,
+            batch=completed_batch,
+        )

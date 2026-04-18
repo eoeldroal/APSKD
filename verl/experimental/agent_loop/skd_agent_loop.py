@@ -409,6 +409,27 @@ class SkdAgentLoop(ToolAgentLoop):
 
         return state
 
+    async def _run_until_terminated(
+        self,
+        agent_data: AgentData,
+        state: AgentState,
+        sampling_params: dict[str, Any],
+    ) -> AgentState:
+        """Advance a restored SKD trajectory to terminal state without boundary pausing."""
+        while state != AgentState.TERMINATED:
+            if state == AgentState.PENDING:
+                state = await self._handle_pending_state(agent_data, sampling_params)
+            elif state == AgentState.GENERATING:
+                state = await self._handle_generating_state(agent_data, sampling_params)
+            elif state == AgentState.PROCESSING_TOOLS:
+                state = await self._handle_processing_tools_state(agent_data)
+            elif state == AgentState.INTERACTING:
+                state = await self._handle_interacting_state(agent_data)
+            else:
+                raise ValueError(f"Invalid AgentState while completing SKD partial: {state}")
+
+        return state
+
     async def run_until_exportable_boundary(
         self,
         sampling_params: dict[str, Any],
@@ -437,6 +458,17 @@ class SkdAgentLoop(ToolAgentLoop):
             logical_step=logical_step,
             source_type=source_type,
         )
+
+    async def run_from_partial_to_completion(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        partial_state: SkdPartialState,
+    ) -> AgentLoopOutput:
+        """Resume a partial SKD trajectory and run it to terminal completion."""
+        agent_data, state = self._restore_partial_state(partial_state)
+        await self._run_until_terminated(agent_data, state, sampling_params)
+        return self._finalize_boundary_agent_output(agent_data)
 
     def _assert_teacher_alignment(self, agent_data: AgentData) -> None:
         """Validate that response_mask and teacher rows stay response-token aligned."""

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SKD 통합 테스트용 vLLM 서버 2개를 띄우는 스크립트.
-# 서버가 뜬 후 test_skd_integration.py를 실행하면 됨.
+# 서버가 뜬 후 skd_integration_manual.py를 실행하면 됨.
 #
 # Usage:
-#   bash tests/skd/launch_test_servers.sh
+#   bash tests/skd/manual/launch_test_servers.sh
 #   # 서버 Ready 후 다른 터미널에서:
-#   python tests/skd/test_skd_integration.py
+#   python tests/skd/manual/skd_integration_manual.py
 
 set -euo pipefail
 
@@ -63,7 +63,7 @@ echo "  Student: http://127.0.0.1:${STUDENT_PORT}"
 echo "  Teacher: http://127.0.0.1:${TEACHER_PORT}"
 echo ""
 echo "Run test:"
-echo "  python tests/skd/test_skd_integration.py"
+echo "  python tests/skd/manual/skd_integration_manual.py"
 echo ""
 echo "Press Ctrl+C to stop both servers."
 echo "============================================"
