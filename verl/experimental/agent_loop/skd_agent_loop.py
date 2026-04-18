@@ -40,7 +40,7 @@ from verl.experimental.agent_loop.agent_loop import (
     register,
 )
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
-from verl.experimental.async_skd.state import RESUMABLE_COMMITTED_UNITS, SkdPartialState
+from verl.experimental.async_skd.state import SkdPartialState
 from verl.utils.profiler import simple_timer
 
 logger = logging.getLogger(__file__)

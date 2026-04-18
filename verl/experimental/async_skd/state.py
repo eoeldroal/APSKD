@@ -3,21 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 from verl.protocol import DataProto
 
 
-class SkdCommittedUnit(str, Enum):
-    """Last fully committed atomic unit in an SKD trajectory."""
-
-    ASSISTANT_GEN_CHUNK = "ASSISTANT_GEN_CHUNK"
-    ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT = "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
-    ASSISTANT_GEN_CHUNK_WITH_INTERACTION_RESULT = "ASSISTANT_GEN_CHUNK_WITH_INTERACTION_RESULT"
-
-
-RESUMABLE_COMMITTED_UNITS: frozenset[str] = frozenset(unit.value for unit in SkdCommittedUnit)
 ASYNC_SKD_SAMPLE_KIND_COMPLETED = "completed"
 ASYNC_SKD_SAMPLE_KIND_PARTIAL = "partial"
 ASYNC_SKD_SAMPLE_KINDS: frozenset[str] = frozenset(
@@ -54,7 +44,7 @@ def _optional_int(value: Any) -> int | None:
 
 @dataclass
 class SkdPartialState:
-    """Snapshot of an unfinished SKD trajectory at a committed-unit boundary.
+    """Snapshot of an unfinished SKD trajectory at an exportable handler boundary.
 
     This is intentionally separate from ``AgentData``.  ``AgentData`` is a
     runtime object and can contain live handles or tool/interact objects.  This
@@ -66,7 +56,6 @@ class SkdPartialState:
     logical_step: int
     source_type: str
     agent_state: str
-    last_committed_unit: str
 
     request_id: str
     tools_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -243,11 +232,6 @@ class AsyncSkdSample:
             raise ValueError(
                 f"Partial AsyncSkdSample source_type mismatch: envelope={self.source_type!r}, "
                 f"partial={self.partial_state.source_type!r}"
-            )
-        if self.partial_state.last_committed_unit not in RESUMABLE_COMMITTED_UNITS:
-            raise ValueError(
-                "Partial AsyncSkdSample last_committed_unit is not resumable: "
-                f"{self.partial_state.last_committed_unit!r}"
             )
 
         for key in ("rollout_birth_version", "rollout_min_version", "rollout_max_version"):
