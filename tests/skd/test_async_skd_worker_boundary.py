@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
-from verl.experimental.async_skd.state import AsyncSkdSample, SkdCommittedUnit, SkdPartialState
+from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
 from tests.experimental.agent_loop.test_agent_loop_extra_fields_schema_on_cpu import _FakeTokenizer
@@ -46,7 +46,6 @@ def make_partial() -> SkdPartialState:
         logical_step=12,
         source_type="lookahead",
         agent_state="generating",
-        last_committed_unit=SkdCommittedUnit.ASSISTANT_GEN_CHUNK.value,
         request_id="req-partial",
         messages=raw_prompt,
         prompt_ids=[1, 2, 3, 10],
@@ -65,7 +64,6 @@ def make_partial() -> SkdPartialState:
             "teacher_prompt_ids": [1, 2, 3, 10],
             "teacher_ids_list": [[10, 0, 0, 0]],
             "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
-            "skd_last_committed_unit": SkdCommittedUnit.ASSISTANT_GEN_CHUNK.value,
             "skd_pending_turn_response_ids": [10],
             "skd_committed_gen_chunks": 1,
             "skd_committed_env_units": 0,
