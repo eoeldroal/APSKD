@@ -25,6 +25,8 @@ from verl.workers.rollout.replica import TokenOutput
 EOS = 99999
 TOOL_CALL_A = 81001
 TOOL_CALL_B = 81002
+OPEN_TOOL = 91001
+CLOSE_TOOL = 91002
 LOSS_TOP_K = 4
 VERIFY_TOP_K = 3
 
@@ -35,6 +37,24 @@ class FakeTokenizer:
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         del skip_special_tokens
         return " ".join(str(i) for i in ids)
+
+
+class FakeHermesTokenizer:
+    eos_token_id = EOS
+
+    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        del skip_special_tokens
+        text_parts = []
+        for token_id in ids:
+            if token_id == OPEN_TOOL:
+                text_parts.append("<tool_call>")
+            elif token_id == CLOSE_TOOL:
+                text_parts.append("</tool_call>")
+            elif token_id == EOS:
+                text_parts.append("<|im_end|>")
+            else:
+                text_parts.append(str(token_id))
+        return "".join(text_parts)
 
 
 class FakeStudentServer:
@@ -483,6 +503,58 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
 
 
 @pytest.mark.asyncio
+async def test_skd_export_allows_open_tool_call_prefix_without_eos():
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert next_state == AgentState.GENERATING
+    assert loop._can_export_partial_state(agent_data, next_state)
+    assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_export_rejects_closed_tool_call_without_eos():
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11, CLOSE_TOOL],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert next_state == AgentState.GENERATING
+    assert not loop._can_export_partial_state(agent_data, next_state)
+    assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
 async def test_skd_boundary_driver_closes_tool_macro_step_before_export(monkeypatch):
     async def fake_tool_step(self, agent_data):
         del self
@@ -515,6 +587,48 @@ async def test_skd_boundary_driver_closes_tool_macro_step_before_export(monkeypa
     assert agent_data.assistant_turns == 1
     assert agent_data.user_turns == 1
     assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
+    assert agent_data.extra_fields["skd_committed_gen_chunks"] == 1
+    assert agent_data.extra_fields["skd_committed_env_units"] == 1
+    assert_skd_alignment(agent_data)
+    assert_masked_teacher_rows(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_boundary_driver_closes_eos_tool_call_before_export(monkeypatch):
+    async def fake_tool_step(self, agent_data):
+        del self
+        tool_tokens = [900, 901]
+        agent_data.messages.append({"role": "tool", "content": "tool result"})
+        agent_data.prompt_ids += tool_tokens
+        agent_data.response_mask += [0] * len(tool_tokens)
+        agent_data.user_turns += 1
+        return AgentState.GENERATING
+
+    class _Parser:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            del response_ids, tools
+            return None, [FakeToolCall(name="lookup", arguments='{"query":"weather"}')]
+
+    monkeypatch.setattr(ToolAgentLoop, "_handle_processing_tools_state", fake_tool_step)
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11, CLOSE_TOOL, EOS],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    loop.tool_parser = _Parser()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await loop._run_until_exportable_boundary(agent_data, AgentState.GENERATING, {})
+
+    assert next_state == AgentState.GENERATING
+    assert loop._can_export_partial_state(agent_data, next_state)
+    assert agent_data.prompt_ids == [1, 2, 3, OPEN_TOOL, 11, CLOSE_TOOL, EOS, 900, 901]
+    assert agent_data.response_mask == [1, 1, 1, 1, 0, 0]
     assert agent_data.extra_fields["skd_committed_gen_chunks"] == 1
     assert agent_data.extra_fields["skd_committed_env_units"] == 1
     assert_skd_alignment(agent_data)
