@@ -236,6 +236,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         num_workers = len(self.agent_loop_workers)
         worker_capacity = max(1, math.ceil(len(prompts) / num_workers))
         worker_active_counts = [0 for _ in range(num_workers)]
+        worker_completed_counts = [0 for _ in range(num_workers)]
         worker_active_max = 0
 
         def worker_idx_for_pos(pos: int) -> int:
@@ -317,6 +318,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     pos, worker_idx = base_active.pop(task)
                     note_finish(worker_idx)
                     base_completed[pos] = await task
+                    worker_completed_counts[worker_idx] += 1
                     if not base_active:
                         drain_requested = True
                     try_admit_lookahead(worker_idx)
@@ -329,6 +331,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     sample.validate()
                     if sample.kind == "completed":
                         promoted_lookahead.append((admission_order, sample))
+                        worker_completed_counts[worker_idx] += 1
                         if not drain_requested:
                             try_admit_lookahead(worker_idx)
                         continue
@@ -348,6 +351,8 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             "async_skd/worker_active_max": worker_active_max,
             "async_skd/lookahead_started_count": lookahead_started_count,
         }
+        for idx, count in enumerate(worker_completed_counts):
+            self._async_skd_last_worker_slot_metrics[f"async_skd/worker_{idx}_completed_count"] = count
         self._async_skd_last_promoted_samples = [
             sample for _, sample in sorted(promoted_lookahead, key=lambda item: item[0])
         ]

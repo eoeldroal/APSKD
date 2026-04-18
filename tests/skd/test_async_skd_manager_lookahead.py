@@ -44,7 +44,9 @@ class _FakeLookaheadWorker:
         input_pos = int(sample.non_tensor_batch["input_pos"][0])
         self._calls.append((self._name, "base", input_pos))
         await asyncio.sleep(self._base_delays.get(input_pos, 0.0))
-        return _make_output(input_pos)
+        output = _make_output(input_pos)
+        output.meta_info["metrics"][0]["rollout_server_id"] = self._name
+        return output
 
     async def _generate_skd_until_boundary(
         self,
@@ -63,12 +65,18 @@ class _FakeLookaheadWorker:
             assert partial_state is not None
             self._calls.append((self._name, "resume", sample_id))
         await asyncio.sleep(0)
-        return self._lookahead_results[sample_id].pop(0)
+        sample = self._lookahead_results[sample_id].pop(0)
+        if sample.kind == "completed":
+            sample.require_completed().meta_info["metrics"][0]["rollout_server_id"] = self._name
+        return sample
 
     async def _generate_skd_from_partial_to_completion(self, partial_state: SkdPartialState) -> AsyncSkdSample:
         self._calls.append((self._name, "carryover", partial_state.sample_id))
         await asyncio.sleep(0)
-        return self._lookahead_results[partial_state.sample_id].pop(0)
+        sample = self._lookahead_results[partial_state.sample_id].pop(0)
+        if sample.kind == "completed":
+            sample.require_completed().meta_info["metrics"][0]["rollout_server_id"] = self._name
+        return sample
 
 
 class _FakeLookaheadSource:
@@ -512,6 +520,29 @@ async def test_lookahead_refill_stops_after_base_barrier_drain():
     lookahead_calls = [call for call in calls if call[1] == "lookahead"]
     assert len(lookahead_calls) <= 2
     assert len(source.source_items) >= 4
+
+
+@pytest.mark.asyncio
+async def test_lookahead_reports_worker_slot_and_server_distribution_metrics():
+    manager, _, _ = _make_manager(
+        prefetch_limit=2,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+        },
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+    timing = output.meta_info["timing"]
+
+    assert timing["async_skd/worker_capacity"] == 2
+    assert timing["async_skd/lookahead_started_count"] == 2
+    assert "async_skd/worker_0_completed_count" in timing
+    assert "async_skd/worker_1_completed_count" in timing
 
 
 @pytest.mark.asyncio
