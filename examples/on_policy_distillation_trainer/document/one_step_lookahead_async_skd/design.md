@@ -1584,11 +1584,13 @@ When a current-step sample finishes:
 
 This is worker-replica aware, not exact GPU-number aware. Exact CUDA device id is not needed for the first implementation. Under TP=1 and one SGLang server per replica, worker/server-replica identity is the useful scheduling unit.
 
+The first implementation is worker-slot aware. It does not require exact CUDA device ids and does not force preferred SGLang server routing. Server replica ids are observed through output metadata so worker-level scheduling can be compared against actual SGLang server distribution.
+
 Server-replica observability should be added before server-directed routing:
 
 ```text
 AsyncLLMServerManager.generate records rollout_server_id in TokenOutput.extra_fields.
-Manager logs worker_idx -> rollout_server_id distribution.
+Async SKD manager logs worker slot capacity, max active count, started lookahead count, and per-worker completed counts.
 ```
 
 Do not add preferred-server routing in the first pass. If metrics show worker-level refill does not correlate with server-replica load, then add a later API:

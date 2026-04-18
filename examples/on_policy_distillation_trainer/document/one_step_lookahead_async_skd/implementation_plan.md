@@ -1240,9 +1240,10 @@ tests/skd/test_async_skd_manager_lookahead.py
 Current state:
 
 ```text
-base_active: dict[Task, int]
-lookahead_active: dict[Task, int]
-lookahead worker assignment: round-robin
+implemented in Patch 12
+base_active: dict[Task, tuple[int, int]]
+lookahead_active: dict[Task, tuple[int, int]]
+lookahead worker assignment: same-worker slot refill
 ```
 
 Replace with worker-aware bookkeeping:
@@ -1295,6 +1296,7 @@ Why worker-level first:
 - The manager currently knows worker handles, not exact CUDA device ids.
 - SGLang batches individual outstanding requests internally.
 - Under TP=1, one SGLang server replica usually maps to one GPU, but manager should not rely on CUDA numbers.
+- Preferred-server routing is allowed only after server-replica metrics show worker-level refill is insufficient.
 
 Tests:
 
@@ -1708,6 +1710,8 @@ Expected behavior:
 
 ### Patch 12: Worker-Slot Refill Lookahead
 
+Status: implemented.
+
 Files:
 
 ```text
@@ -1720,8 +1724,11 @@ Changes:
 - replace round-robin lookahead worker assignment with same-worker slot refill.
 - store `worker_idx` in active task bookkeeping.
 - maintain `worker_active_counts`.
-- derive `worker_capacity = ceil(current_work_count / num_workers)` unless config overrides it.
+- derive `worker_capacity = ceil(current_work_count / num_workers)`.
 - call `try_admit_lookahead(worker_idx)` when a current task frees a slot.
+- report `async_skd/worker_capacity`, `async_skd/worker_active_max`, `async_skd/lookahead_started_count`, and per-worker completed counts.
+
+This patch is implemented before preferred-server routing. Preferred-server routing is allowed only after server-replica metrics show worker-level refill is insufficient.
 
 Expected behavior:
 
@@ -1731,6 +1738,8 @@ Expected behavior:
 - `drain_requested=True` prevents any new lookahead admission.
 
 ### Patch 13: Server-Replica Observability
+
+Status: implemented for rollout output metadata.
 
 Files:
 
@@ -1744,7 +1753,7 @@ tests/skd/test_async_skd_manager_lookahead.py
 Changes:
 
 - record acquired `server_id` in `TokenOutput.extra_fields`, e.g. `rollout_server_id`.
-- log or expose worker_idx to rollout_server_id distribution in async SKD metrics.
+- keep `rollout_server_id` in per-sample output metrics and expose async SKD worker-slot scheduler counters.
 - do not add preferred-server routing yet.
 
 Expected behavior:
