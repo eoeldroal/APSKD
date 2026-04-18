@@ -94,7 +94,7 @@ worker.generate_sequence_single(sample) x 24:
 Lookahead는 이 sample-level completion visibility 위에 붙인다. Base batch가 끝나면 `drain_requested=True`가 되고, active lookahead task는 강제 cancel하지 않는다. 대신 `skd_agent_loop.py`가 제공하는 cooperative export predicate를 사용한다.
 
 ```text
-_handle_generating_state(..., stop_after_committed_unit=True)
+_handle_generating_state(..., stop_after_skd_chunk=True)
 _run_until_exportable_boundary(...)
 ```
 
@@ -1482,7 +1482,7 @@ GENERATING
       if EOS:
         parse tool calls
         -> PROCESSING_TOOLS | INTERACTING | TERMINATED
-      if no EOS and stop_after_committed_unit:
+      if no EOS and stop_after_skd_chunk:
         -> GENERATING
 
 PROCESSING_TOOLS

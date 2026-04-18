@@ -25,6 +25,8 @@ from verl.workers.rollout.replica import TokenOutput
 EOS = 99999
 TOOL_CALL_A = 81001
 TOOL_CALL_B = 81002
+OPEN_TOOL = 91001
+CLOSE_TOOL = 91002
 LOSS_TOP_K = 4
 VERIFY_TOP_K = 3
 
@@ -35,6 +37,24 @@ class FakeTokenizer:
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         del skip_special_tokens
         return " ".join(str(i) for i in ids)
+
+
+class FakeHermesTokenizer:
+    eos_token_id = EOS
+
+    def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
+        del skip_special_tokens
+        text_parts = []
+        for token_id in ids:
+            if token_id == OPEN_TOOL:
+                text_parts.append("<tool_call>")
+            elif token_id == CLOSE_TOOL:
+                text_parts.append("</tool_call>")
+            elif token_id == EOS:
+                text_parts.append("<|im_end|>")
+            else:
+                text_parts.append(str(token_id))
+        return "".join(text_parts)
 
 
 class FakeStudentServer:
@@ -263,7 +283,6 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
     assert 22 not in agent_data.response_ids
     assert_skd_alignment(agent_data)
     assert_committed_tokens_inside_teacher_topk(agent_data)
-    assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK"
     assert agent_data.extra_fields["skd_committed_gen_chunks"] == 3
     assert agent_data.extra_fields["skd_committed_env_units"] == 0
     assert agent_data.extra_fields["skd_committed_prefix_tokens"] == 8
@@ -276,7 +295,6 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
     assert agent_data.extra_fields["teacher_prompt_ids"][-4:] == [900, 901, 902, 903]
     assert_skd_alignment(agent_data)
     assert_masked_teacher_rows(agent_data)
-    assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
     assert agent_data.extra_fields["skd_committed_gen_chunks"] == 3
     assert agent_data.extra_fields["skd_committed_env_units"] == 1
     assert agent_data.extra_fields["skd_committed_prefix_tokens"] == 12
@@ -294,7 +312,6 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
     assert partial.logical_step == 10
     assert partial.source_type == "lookahead"
     assert partial.agent_state == AgentState.GENERATING.value
-    assert partial.last_committed_unit == "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
     assert partial.prompt_ids == agent_data.prompt_ids
     assert partial.teacher_prompt_ids == agent_data.extra_fields["teacher_prompt_ids"]
     assert partial.response_mask == agent_data.response_mask
@@ -327,7 +344,6 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
     assert restored_agent_data.response_mask == partial.response_mask
     assert restored_agent_data.extra_fields["teacher_ids_list"] == partial.extra_fields["teacher_ids_list"]
     assert restored_agent_data.extra_fields["teacher_logprobs_list"] == partial.extra_fields["teacher_logprobs_list"]
-    assert restored_agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
     assert restored_agent_data.extra_fields["skd_committed_gen_chunks"] == 3
     assert restored_agent_data.extra_fields["skd_committed_env_units"] == 1
     assert restored_agent_data.extra_fields["skd_committed_prefix_tokens"] == 12
@@ -371,7 +387,6 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
     assert_skd_alignment(restored_agent_data)
     assert_masked_teacher_rows(restored_agent_data)
     assert_committed_tokens_inside_teacher_topk(restored_agent_data)
-    assert restored_agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK"
     assert restored_agent_data.extra_fields["skd_termination_reason"] == "eos"
     assert restored_agent_data.extra_fields["skd_committed_gen_chunks"] == 6
     assert restored_agent_data.extra_fields["skd_committed_env_units"] == 1
@@ -405,7 +420,6 @@ async def test_rejection_at_first_token_discards_suffix():
     assert agent_data.metrics["skd"]["accept_count"] == 0
     assert_skd_alignment(agent_data)
     assert_committed_tokens_inside_teacher_topk(agent_data)
-    assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK"
     assert agent_data.extra_fields["skd_termination_reason"] == "max_chunks"
     assert agent_data.extra_fields["skd_committed_gen_chunks"] == 1
     assert agent_data.extra_fields["skd_committed_env_units"] == 0
@@ -433,7 +447,7 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
         agent_data,
         {},
         False,
-        stop_after_committed_unit=True,
+        stop_after_skd_chunk=True,
     )
 
     assert next_state == AgentState.GENERATING
@@ -442,7 +456,6 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
     assert agent_data.response_ids == [10, 11]
     assert agent_data.response_mask == [1, 1]
     assert agent_data.assistant_turns == 0
-    assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK"
     assert agent_data.extra_fields["skd_termination_reason"] == "committed_unit_boundary"
     assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
     assert_skd_alignment(agent_data)
@@ -483,6 +496,58 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
 
 
 @pytest.mark.asyncio
+async def test_skd_export_allows_open_tool_call_prefix_without_eos():
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert next_state == AgentState.GENERATING
+    assert loop._can_export_partial_state(agent_data, next_state)
+    assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_export_rejects_closed_tool_call_without_eos():
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11, CLOSE_TOOL],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert next_state == AgentState.GENERATING
+    assert not loop._can_export_partial_state(agent_data, next_state)
+    assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
 async def test_skd_boundary_driver_closes_tool_macro_step_before_export(monkeypatch):
     async def fake_tool_step(self, agent_data):
         del self
@@ -514,7 +579,48 @@ async def test_skd_boundary_driver_closes_tool_macro_step_before_export(monkeypa
     assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, EOS]
     assert agent_data.assistant_turns == 1
     assert agent_data.user_turns == 1
-    assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
+    assert agent_data.extra_fields["skd_committed_gen_chunks"] == 1
+    assert agent_data.extra_fields["skd_committed_env_units"] == 1
+    assert_skd_alignment(agent_data)
+    assert_masked_teacher_rows(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_boundary_driver_closes_eos_tool_call_before_export(monkeypatch):
+    async def fake_tool_step(self, agent_data):
+        del self
+        tool_tokens = [900, 901]
+        agent_data.messages.append({"role": "tool", "content": "tool result"})
+        agent_data.prompt_ids += tool_tokens
+        agent_data.response_mask += [0] * len(tool_tokens)
+        agent_data.user_turns += 1
+        return AgentState.GENERATING
+
+    class _Parser:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            del response_ids, tools
+            return None, [FakeToolCall(name="lookup", arguments='{"query":"weather"}')]
+
+    monkeypatch.setattr(ToolAgentLoop, "_handle_processing_tools_state", fake_tool_step)
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11, CLOSE_TOOL, EOS],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    loop.tool_parser = _Parser()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await loop._run_until_exportable_boundary(agent_data, AgentState.GENERATING, {})
+
+    assert next_state == AgentState.GENERATING
+    assert loop._can_export_partial_state(agent_data, next_state)
+    assert agent_data.prompt_ids == [1, 2, 3, OPEN_TOOL, 11, CLOSE_TOOL, EOS, 900, 901]
+    assert agent_data.response_mask == [1, 1, 1, 1, 0, 0]
     assert agent_data.extra_fields["skd_committed_gen_chunks"] == 1
     assert agent_data.extra_fields["skd_committed_env_units"] == 1
     assert_skd_alignment(agent_data)
@@ -559,7 +665,6 @@ async def test_skd_run_until_exportable_boundary_fresh_returns_partial():
     assert result.logical_step == 12
     assert result.source_type == "lookahead"
     assert result.agent_state == AgentState.GENERATING.value
-    assert result.last_committed_unit == "ASSISTANT_GEN_CHUNK"
     assert result.prompt_ids == [1, 2, 3, 10, 11]
     assert result.response_ids == [10, 11]
     assert result.response_mask == [1, 1]
@@ -578,7 +683,6 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
         logical_step=13,
         source_type="lookahead",
         agent_state=AgentState.GENERATING.value,
-        last_committed_unit="ASSISTANT_GEN_CHUNK",
         request_id="req-resume-boundary",
         tools_kwargs={},
         messages=[{"role": "user", "content": "question"}],
@@ -600,7 +704,6 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
             "teacher_prompt_ids": [1, 2, 3, 10, 11],
             "teacher_ids_list": [[10, 0, 0, 0], [11, 0, 0, 0]],
             "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
-            "skd_last_committed_unit": "ASSISTANT_GEN_CHUNK",
             "skd_pending_turn_response_ids": [10, 11],
             "skd_committed_gen_chunks": 1,
             "skd_committed_env_units": 0,
@@ -651,7 +754,6 @@ async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediat
         logical_step=13,
         source_type="lookahead",
         agent_state=AgentState.GENERATING.value,
-        last_committed_unit="ASSISTANT_GEN_CHUNK",
         request_id="req-resume-to-completion",
         tools_kwargs={},
         messages=[{"role": "user", "content": "question"}],
@@ -673,7 +775,6 @@ async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediat
             "teacher_prompt_ids": [1, 2, 3, 10],
             "teacher_ids_list": [[10, 0, 0, 0]],
             "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
-            "skd_last_committed_unit": "ASSISTANT_GEN_CHUNK",
             "skd_pending_turn_response_ids": [10],
             "skd_committed_gen_chunks": 1,
             "skd_committed_env_units": 0,
@@ -759,7 +860,6 @@ async def test_tool_macro_step_appends_dummy_teacher_rows(monkeypatch):
     assert teacher_logprobs(agent_data)[-3:] == [[0.0] * LOSS_TOP_K] * 3
     assert_skd_alignment(agent_data)
     assert_masked_teacher_rows(agent_data)
-    assert agent_data.extra_fields["skd_last_committed_unit"] == "ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT"
     assert agent_data.extra_fields.get("skd_committed_gen_chunks", 0) == 0
     assert agent_data.extra_fields["skd_committed_env_units"] == 1
     assert agent_data.extra_fields["skd_committed_prefix_tokens"] == 3
@@ -789,7 +889,6 @@ async def test_budget_boundary_does_not_append_partial_tool_result(monkeypatch):
     assert agent_data.response_mask == [1]
     assert agent_data.extra_fields["teacher_prompt_ids"] == [91, 11]
     assert_skd_alignment(agent_data)
-    assert "skd_last_committed_unit" not in agent_data.extra_fields
     assert agent_data.extra_fields.get("skd_committed_env_units", 0) == 0
     assert agent_data.extra_fields.get("skd_committed_prefix_tokens", 0) == 0
 

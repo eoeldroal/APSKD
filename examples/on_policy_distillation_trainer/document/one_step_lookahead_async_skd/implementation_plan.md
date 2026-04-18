@@ -653,7 +653,7 @@ async def generate_skd_from_partial_to_completion(
 역할:
 
 - `SkdAgentLoop.run_from_partial_to_completion()`을 호출한다.
-- `_restore_partial_state()`로 복원한 뒤 `stop_after_committed_unit=False` 경로로 `TERMINATED`까지 진행한다.
+- `_restore_partial_state()`로 복원한 뒤 `stop_after_skd_chunk=False` 경로로 `TERMINATED`까지 진행한다.
 - 반환값은 항상 `AsyncSkdSample(kind="completed", source_type="resumed_current")`다.
 - 이 함수는 next-step current work에 들어온 carry-over sample용이다. Lookahead drain에는 사용하지 않는다.
 
@@ -747,7 +747,7 @@ Rule:
 verl/experimental/agent_loop/skd_agent_loop.py
 ```
 
-### 9.1 Add `stop_after_committed_unit`
+### 9.1 Add `stop_after_skd_chunk`
 
 ```python
 async def _handle_generating_state(
@@ -755,12 +755,12 @@ async def _handle_generating_state(
     agent_data: AgentData,
     sampling_params: dict[str, Any],
     ignore_termination: bool = False,
-    stop_after_committed_unit: bool = False,
+    stop_after_skd_chunk: bool = False,
 ) -> AgentState:
-    ...
+    pass
 ```
 
-`stop_after_committed_unit=True`일 때:
+`stop_after_skd_chunk=True`일 때:
 
 - SKD chunk 하나를 생성한다.
 - teacher verification과 first-rejection commit을 끝낸다.
@@ -768,7 +768,7 @@ async def _handle_generating_state(
 - EOS가 있으면 parser/interaction/termination 분기를 처리한다.
 - EOS가 없고 Qwen/Hermes tool boundary가 export 가능한 경우 `AgentState.GENERATING`을 반환한다.
 
-기존 full rollout path는 `stop_after_committed_unit=False`이므로 그대로 끝까지 진행한다.
+기존 full rollout path는 `stop_after_skd_chunk=False`이므로 그대로 끝까지 진행한다.
 
 ### 9.2 Preserve Pending Assistant Turn State
 
@@ -806,7 +806,7 @@ async def _run_until_exportable_boundary(
 이 driver의 의미:
 
 - `PENDING`은 prompt stream만 초기화하므로 export하지 않고 계속 진행한다.
-- `GENERATING`은 `stop_after_committed_unit=True`로 chunk boundary까지 진행한다.
+- `GENERATING`은 `stop_after_skd_chunk=True`로 chunk boundary까지 진행한다.
 - `PROCESSING_TOOLS`는 tool macro-step 전체를 닫는다.
 - `INTERACTING`은 interaction/user response 전체를 닫는다.
 - `_can_export_partial_state()`가 허용하는 지점에서만 반환한다.
@@ -1594,7 +1594,7 @@ async_skd/worker.py
 
 Changes:
 
-- `_handle_generating_state(..., stop_after_committed_unit=True)`
+- `_handle_generating_state(..., stop_after_skd_chunk=True)`
 - `skd_pending_turn_response_ids`
 - `_run_until_exportable_boundary()`
 - tool/interact macro-step closure before export

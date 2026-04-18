@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from verl.experimental.async_skd.data_source import AsyncSkdDataSource
-from verl.experimental.async_skd.state import AsyncSkdSample, SkdCommittedUnit, SkdPartialState
+from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.protocol import DataProto
 
 
@@ -57,7 +57,6 @@ def _partial(sample_id: str) -> SkdPartialState:
         logical_step=4,
         source_type="lookahead",
         agent_state="generating",
-        last_committed_unit=SkdCommittedUnit.ASSISTANT_GEN_CHUNK.value,
         request_id=f"req-{sample_id}",
         response_ids=[1],
         response_mask=[1],

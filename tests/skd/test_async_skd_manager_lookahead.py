@@ -11,7 +11,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.experimental.async_skd.manager import AsyncSkdAgentLoopManager
-from verl.experimental.async_skd.state import AsyncSkdSample, SkdCommittedUnit, SkdPartialState
+from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.protocol import DataProto
 
 
@@ -170,7 +170,6 @@ def _make_partial(sample_id: str, logical_step: int = 4) -> SkdPartialState:
         logical_step=logical_step,
         source_type="lookahead",
         agent_state="generating",
-        last_committed_unit=SkdCommittedUnit.ASSISTANT_GEN_CHUNK.value,
         request_id=f"req-{sample_id}",
         response_ids=[1],
         response_mask=[1],
