@@ -213,6 +213,8 @@ class AsyncLLMServerManager:
                 has_images=bool(image_data),
                 has_videos=bool(video_data),
             )
+            if hasattr(output, "extra_fields") and output.extra_fields is not None:
+                output.extra_fields["rollout_server_id"] = server_id
             return output
         finally:
             release_timer = monkey_patch_timing_begin(capture_gpu=False)
