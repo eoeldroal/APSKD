@@ -1698,6 +1698,8 @@ train_gen_output = base_gen_output + promoted_gen_output
 
 The row order of these two concatenations must match exactly. Otherwise `uid`, reward metadata, teacher metadata, and generated tensors can be paired with the wrong sample.
 
+Carry-over current work has one extra trainer-side rule. The fresh rows are converted to generation prompts with `_get_gen_batch(fresh_batch)`, while the combined `current_input_batch` must separately be converted to trainer-ready input rows with `_prepare_async_skd_current_input_batch(current_input_batch)`. This removes generation-only non-tensor fields before `DataProto.union()`.
+
 ## 13. Recommended MVP
 
 MVP should be conservative.

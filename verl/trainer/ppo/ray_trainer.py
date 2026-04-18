@@ -605,6 +605,18 @@ class RayPPOTrainer:
 
         return DataProto.concat([batch] + train_ready_promoted_inputs)
 
+    def _prepare_async_skd_current_input_batch(self, batch: DataProto) -> DataProto:
+        """Mutate current input rows into trainer-ready rows.
+
+        Carry-over current work uses a separate fresh generation batch, so the
+        combined current input batch still contains generation-only non-tensor
+        fields.  Strip those fields with the same rule as ``_get_gen_batch`` so
+        later ``batch.union(gen_batch_output)`` receives train input rows only.
+        """
+        self._ensure_batch_uid(batch)
+        self._get_gen_batch(batch)
+        return batch
+
     def _iter_training_batches(self):
         if not self._is_async_skd_lookahead_enabled():
             for batch_dict in self.train_dataloader:
@@ -1494,6 +1506,7 @@ class RayPPOTrainer:
 
                 if carryover_partials:
                     gen_batch = self._get_gen_batch(fresh_batch) if fresh_batch is not None else None
+                    self._prepare_async_skd_current_input_batch(batch)
                     gen_batch_output = None
                     if gen_batch is not None:
                         gen_batch.meta_info["global_steps"] = self.global_steps

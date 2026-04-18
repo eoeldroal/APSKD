@@ -6,7 +6,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.experimental.async_skd.data_source import AsyncSkdDataSource
-from verl.experimental.async_skd.state import AsyncSkdSample
+from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.protocol import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
@@ -58,6 +58,28 @@ def _completed(sample_id: str, batch: DataProto) -> AsyncSkdSample:
         source_type="lookahead",
         batch=batch,
     )
+
+
+def _partial(sample_id: str) -> SkdPartialState:
+    return SkdPartialState(
+        sample_id=sample_id,
+        logical_step=4,
+        source_type="lookahead",
+        agent_state="generating",
+        request_id=f"req-{sample_id}",
+        response_ids=[1],
+        response_mask=[1],
+        extra_fields={
+            "teacher_ids_list": [[1, 0, 0, 0]],
+            "teacher_logprobs_list": [[-1.0, 0.0, 0.0, 0.0]],
+        },
+    )
+
+
+def _single_input_row(value: int, uid: str) -> DataProto:
+    batch = DataProto.from_single_dict(_batch_dict(value, 1))
+    batch.non_tensor_batch["uid"] = np.array([uid], dtype=object)
+    return batch
 
 
 def _make_trainer(
@@ -127,6 +149,46 @@ def test_iter_training_batches_lookahead_uses_async_skd_source_and_binds_manager
     assert fresh_batch.non_tensor_batch["input_pos"].tolist() == [10, 11]
     assert current_input_batch.non_tensor_batch["input_pos"].tolist() == [10, 11]
     assert trainer.async_rollout_manager.source is trainer._async_skd_data_source
+
+
+def test_prepare_async_skd_current_input_batch_matches_fresh_generation_batch_keys():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(10, 4)])), uid_fn=_UidFactory())
+    carryover, fresh_batch, current_input_batch = source.next_current_batch(base_batch_size=2)
+    assert carryover == []
+    assert fresh_batch is not None
+    assert current_input_batch is not None
+    current_input_batch.non_tensor_batch["extra_generation_key"] = np.array(["x", "y"], dtype=object)
+    fresh_batch.non_tensor_batch["extra_generation_key"] = np.array(["x", "y"], dtype=object)
+
+    gen_batch = trainer._get_gen_batch(fresh_batch)
+    trainer._prepare_async_skd_current_input_batch(current_input_batch)
+
+    assert "extra_generation_key" in gen_batch.non_tensor_batch
+    assert "extra_generation_key" not in current_input_batch.non_tensor_batch
+    assert current_input_batch.non_tensor_batch.keys() == {"reward_model", "uid"}
+
+
+def test_prepare_async_skd_current_input_batch_handles_carryover_and_fresh_rows_together():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(10, 4)])), uid_fn=_UidFactory())
+    source.record_carryover(
+        [_partial("carry-0")],
+        input_batches=[_single_input_row(100, "carry-0")],
+    )
+    carryover, fresh_batch, current_input_batch = source.next_current_batch(base_batch_size=2)
+    assert [partial.sample_id for partial in carryover] == ["carry-0"]
+    assert fresh_batch is not None
+    assert current_input_batch is not None
+    current_input_batch.non_tensor_batch["extra_generation_key"] = np.array(["carry", "fresh"], dtype=object)
+    fresh_batch.non_tensor_batch["extra_generation_key"] = np.array(["fresh"], dtype=object)
+
+    gen_batch = trainer._get_gen_batch(fresh_batch)
+    trainer._prepare_async_skd_current_input_batch(current_input_batch)
+
+    assert gen_batch.non_tensor_batch["input_pos"].tolist() == [10]
+    assert current_input_batch.non_tensor_batch["uid"].tolist() == ["carry-0", "uid-0"]
+    assert current_input_batch.non_tensor_batch.keys() == {"reward_model", "uid"}
 
 
 @pytest.mark.parametrize(

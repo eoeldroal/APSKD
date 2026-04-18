@@ -1023,11 +1023,11 @@ async def generate_sequences_with_carryover(
 carryover_partials -> generate_skd_from_partial_to_completion()
 fresh_prompts -> generate_sequence_single()
 output order -> carryover completed first, fresh completed after
-lookahead admission -> not enabled in this method yet
+lookahead admission -> enabled through shared worker-slot scheduler
 rollout.n -> must be 1
 ```
 
-이 메서드는 next-step current work를 닫기 위한 중간 API다. 즉 `carryover 30 + fresh 66`을 모두 terminal completed `DataProto`로 만든다. Promoted lookahead까지 붙이는 trainer-level dynamic batch assembly는 이후 단계에서 처리한다.
+이 메서드는 next-step current work를 닫기 위한 API다. 즉 `carryover 30 + fresh 66`을 모두 terminal completed `DataProto`로 만들고, current work가 살아 있는 동안 worker slot이 비면 bounded lookahead도 admit한다.
 
 Source assembly contract:
 
@@ -1038,7 +1038,9 @@ AsyncSkdDataSource.next_current_batch(B)
   -> current_input_batch
 ```
 
-`current_input_batch`는 carry-over input rows first, fresh rows after 순서다. 이 순서는 `generate_sequences_with_carryover()`의 output order와 동일해야 한다. Trainer는 이후 `current_input_batch.union(gen_batch_output)`을 수행하므로 row 수와 uid 순서가 맞아야 한다.
+`current_input_batch`는 carry-over input rows first, fresh rows after 순서다. 이 순서는 `generate_sequences_with_carryover()`의 current output order와 동일해야 한다. Trainer는 이후 `current_input_batch.union(gen_batch_output)`을 수행하므로 row 수와 uid 순서가 맞아야 한다.
+
+Carry-over path에서는 fresh generation batch와 current input batch가 분리된다. 따라서 fresh generation batch에는 `_get_gen_batch(fresh_batch)`를 적용하고, current input batch에는 `_prepare_async_skd_current_input_batch(current_input_batch)`를 적용해 generation-only non-tensor fields를 제거한다.
 
 ## 12. Phase 9: Trainer Integration
 
@@ -1095,6 +1097,8 @@ Lookahead mode generation:
 ```text
 fresh_batch -> _get_gen_batch(fresh_batch)
 carryover_partials + fresh_gen_batch -> generate_sequences_with_carryover(...)
+current_input_batch -> _prepare_async_skd_current_input_batch(...)
+current_input_batch + promoted_input_rows -> trainer input batch
 current_input_batch.union(gen_batch_output)
 ```
 
