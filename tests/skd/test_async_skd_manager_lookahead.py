@@ -423,6 +423,98 @@ def test_lookahead_manager_next_fresh_quota_ignores_promoted_count():
 
 
 @pytest.mark.asyncio
+async def test_lookahead_refills_the_worker_that_frees_a_slot_first():
+    manager, calls, source = _make_manager(
+        prefetch_limit=4,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+        base_delays={2: 0.05, 3: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+
+    lookahead_calls = [call for call in calls if call[1] == "lookahead"]
+    worker0_lookahead = [call for call in lookahead_calls if call[0] == "worker-0"]
+    worker1_lookahead = [call for call in lookahead_calls if call[0] == "worker-1"]
+
+    assert len(worker0_lookahead) > len(worker1_lookahead)
+    assert [sample.sample_id for sample in source.promoted_samples] == [
+        "lookahead-100",
+        "lookahead-101",
+        "lookahead-102",
+        "lookahead-103",
+    ]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 100, 101, 102, 103]
+
+
+@pytest.mark.asyncio
+async def test_lookahead_refill_does_not_exceed_worker_capacity():
+    manager, calls, _ = _make_manager(
+        prefetch_limit=4,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+        base_delays={2: 0.05, 3: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+
+    timing = output.meta_info["timing"]
+    assert timing["async_skd/worker_capacity"] == 2
+    assert timing["async_skd/worker_active_max"] <= 2
+    assert timing["async_skd/lookahead_started_count"] == 4
+    assert [call[1] for call in calls].count("lookahead") == 4
+
+
+@pytest.mark.asyncio
+async def test_lookahead_refill_stops_after_base_barrier_drain():
+    manager, calls, source = _make_manager(
+        prefetch_limit=8,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+            ("lookahead-104", _make_source_sample(104)),
+            ("lookahead-105", _make_source_sample(105)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+            "lookahead-104": [_make_completed_sample("lookahead-104", 104)],
+            "lookahead-105": [_make_completed_sample("lookahead-105", 105)],
+        },
+    )
+
+    await manager.generate_sequences(_make_prompts(2))
+
+    lookahead_calls = [call for call in calls if call[1] == "lookahead"]
+    assert len(lookahead_calls) <= 2
+    assert len(source.source_items) >= 4
+
+
+@pytest.mark.asyncio
 async def test_lookahead_manager_rejects_rollout_n_greater_than_one():
     manager, _, _ = _make_manager(
         prefetch_limit=1,
