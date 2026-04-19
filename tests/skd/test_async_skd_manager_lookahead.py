@@ -172,7 +172,7 @@ def _make_completed_sample(
     )
 
 
-def _make_partial(sample_id: str, logical_step: int = 4) -> SkdPartialState:
+def _make_partial(sample_id: str, logical_step: int = 4, committed_gen_chunks: int = 1) -> SkdPartialState:
     return SkdPartialState(
         sample_id=sample_id,
         logical_step=logical_step,
@@ -184,7 +184,7 @@ def _make_partial(sample_id: str, logical_step: int = 4) -> SkdPartialState:
         rollout_birth_version=3,
         rollout_min_version=3,
         rollout_max_version=3,
-        committed_gen_chunks=1,
+        committed_gen_chunks=committed_gen_chunks,
         committed_env_units=0,
         committed_prefix_tokens=1,
         extra_fields={
@@ -194,8 +194,18 @@ def _make_partial(sample_id: str, logical_step: int = 4) -> SkdPartialState:
     )
 
 
-def _make_partial_sample(sample_id: str, logical_step: int = 4) -> AsyncSkdSample:
-    return AsyncSkdSample.from_partial(partial_state=_make_partial(sample_id, logical_step=logical_step))
+def _make_partial_sample(
+    sample_id: str,
+    logical_step: int = 4,
+    committed_gen_chunks: int = 1,
+) -> AsyncSkdSample:
+    return AsyncSkdSample.from_partial(
+        partial_state=_make_partial(
+            sample_id,
+            logical_step=logical_step,
+            committed_gen_chunks=committed_gen_chunks,
+        )
+    )
 
 
 def _make_manager(
@@ -449,6 +459,28 @@ async def test_lookahead_manager_can_continue_partial_before_base_barrier_withou
     assert [call[1] for call in calls].count("lookahead") == 1
     assert [call[1] for call in calls].count("resume") == 1
     assert source.source_items == []
+
+
+@pytest.mark.asyncio
+async def test_lookahead_manager_carries_partial_at_default_old_gen_chunk_cap():
+    manager, calls, source = _make_manager(
+        prefetch_limit=1,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={
+            "lookahead-100": [
+                _make_partial_sample("lookahead-100", committed_gen_chunks=16),
+                _make_completed_sample("lookahead-100", 100),
+            ]
+        },
+        base_delays={1: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(2))
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
+    assert [partial.sample_id for partial in manager._async_skd_carryover_partials] == ["lookahead-100"]
+    assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]
+    assert [call for call in calls if call[1] == "resume"] == []
 
 
 @pytest.mark.asyncio

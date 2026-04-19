@@ -91,6 +91,14 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         )
         return max(0, min(int(value), batch_size))
 
+    def _lookahead_max_old_gen_chunks(self) -> int:
+        value = OmegaConf.select(
+            self.config,
+            "actor_rollout_ref.rollout.agent.async_skd_max_old_gen_chunks",
+            default=16,
+        )
+        return max(0, int(value))
+
     def _next_lookahead_sample(self, logical_step: int) -> tuple[str, DataProto] | None:
         source = self._get_async_skd_data_source()
         if source is None:
@@ -98,8 +106,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         return source.reserve_lookahead(logical_step)
 
     def _can_continue_lookahead_partial(self, partial_state: SkdPartialState) -> bool:
-        del partial_state
-        return True
+        return partial_state.committed_gen_chunks < self._lookahead_max_old_gen_chunks()
 
     def _next_fresh_quota(self, base_batch_size: int) -> int:
         source = self._get_async_skd_data_source()

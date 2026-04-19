@@ -89,7 +89,7 @@ worker.generate_sequence_single(sample) x 24:
 
 `generate_skd_until_boundary()`가 처리하는 lookahead sample은 아직 current batch에 포함되지 않은 투기적(speculative) 실행이다. step barrier 전에 완료되면 promoted, 완료되지 못하면 pause → carryover로 넘어간다. 약속이 없으므로 pause가 허용된다.
 
-`generate_skd_from_partial_to_completion()`이 처리하는 carry-over sample은 `next_current_batch()`가 반환한 순간 current batch에 편입된다. Trainer는 이 step에서 B개를 학습한다는 전제로 동작하므로, 편입된 sample이 또 pause되면 실제 학습 샘플 수가 B보다 적어지고 배치 예산 불변식이 깨진다. 따라서 current batch에 편입된 carry-over는 **이번 step에서 반드시 완료하거나 drop**한다. `version_lag <= 1` hard cap은 이 철학의 기술적 결과다. carry-over가 step k+1에서 또 pause되면 step k+2에서 `version_lag = 2`가 되어 제약을 위반한다.
+`generate_skd_from_partial_to_completion()`이 처리하는 carry-over sample은 `next_current_batch()`가 반환한 순간 current batch에 편입된다. Trainer는 이 step에서 B개를 학습한다는 전제로 동작하므로, 편입된 sample이 또 pause되면 실제 학습 샘플 수가 B보다 적어지고 배치 예산 불변식이 깨진다. 따라서 current batch에 편입된 carry-over는 이번 step에서 terminal까지 완료한다.
 
 Lookahead는 이 sample-level completion visibility 위에 붙인다. Base batch가 끝나면 `drain_requested=True`가 되고, active lookahead task는 강제 cancel하지 않는다. 대신 `skd_agent_loop.py`가 제공하는 cooperative export predicate를 사용한다.
 
@@ -224,24 +224,9 @@ assistant tool-call 생성
 
 Tool result token은 KD loss 대상이 아니다. 그러나 async pause/resume과 stale-prefix budget 관점에서는 tool macro-step 전체가 atomic environment transition이다.
 
-### 2.9 Policy Version
+### 2.9 Policy Version Metadata
 
-Trainer가 update를 한 번 끝낼 때마다 student parameter version을 하나 증가시킨다.
-
-```text
-rollout_version = sample 생성 또는 prefix 생성에 사용된 student rollout snapshot version
-train_version = trainer가 해당 sample을 consume할 때의 current version
-version_lag = train_version - rollout_version
-```
-
-첫 구현에서는 다음을 hard constraint로 둔다.
-
-```text
-version_lag <= 1
-version_span <= 1
-```
-
-`version_span`은 하나의 trajectory 안에서 관측된 `max_rollout_version - min_rollout_version`이다. Weight sync가 export boundary에서만 적용되더라도, old prefix와 new suffix가 섞인 resumed sample은 `version_span=1`이 될 수 있다.
+Trainer가 update를 한 번 끝낼 때마다 student parameter version을 하나 증가시킬 수 있다. MVP에서는 version lag/span을 lookahead continuation gate로 쓰지 않는다. Version metadata는 observability field로만 남기고, stale continuation은 committed SKD generation chunk 수로 제한한다.
 
 ## 3. Design Hyperparameters
 
@@ -274,41 +259,12 @@ Paused carry-over sample 하나가 old version으로 진행할 수 있는 commit
 권장값:
 
 ```text
-max_old_gen_chunks = 2
+max_old_gen_chunks = 16
 ```
 
-이 값은 수학적 stale mismatch를 직접 제어하는 주 cap이다.
+이 값은 stale continuation을 제어하는 유일한 MVP cap이다. SKD chunk size가 256이면 16 chunks는 약 4096 generated tokens다. `max_length=8192` 기준으로 절반, `max_length=12288` 기준으로 1/3 수준이다.
 
-### 3.3 Old Environment Unit Cap
-
-Old version prefix 위에서 완료할 수 있는 full tool/interact unit 수의 상한이다.
-
-권장값:
-
-```text
-max_old_env_units = 1
-```
-
-이 값은 주로 atomicity, context blow-up, resume complexity를 제어한다.
-
-### 3.4 Old Prefix Token Cap
-
-Old version으로 진행된 prefix가 전체 response budget을 과도하게 잠식하지 않도록 하는 보조 guard다.
-
-권장값:
-
-```text
-old_prefix_token_cap = floor(max_response_length / 8)
-```
-
-예시:
-
-```text
-max_response_length = 8192  -> old_prefix_token_cap = 1024
-max_response_length = 12288 -> old_prefix_token_cap = 1536
-```
-
-이 값은 수학적 primary cap이 아니라 시스템 safety guard다. 주된 stale 제어는 `max_old_gen_chunks`가 담당한다.
+`committed_env_units`, `committed_prefix_tokens`, `version_lag`, `version_span`은 MVP continuation gate에서 제외한다. Chunk가 scheduler의 최소 continuation 단위이므로 token/env/version cap을 동시에 넣지 않는다.
 
 ## 4. Mathematical Formulation
 
@@ -789,10 +745,8 @@ trained_reserved_sample_ids
 
 - Finished lookahead promotion이 만드는 current-step distribution skew는 `L_prefetch / (B + L_prefetch)`로 상한이 있다.
 - Unfinished carry-over resume의 mismatch는 `max_old_gen_chunks * delta_k`로 상한이 있다.
-- `age > 1` sample을 drop하면 sample age는 hard cap 된다.
 - Tool result를 atomic unit으로 묶으면 mid-tool state corruption은 구조적으로 방지된다.
 - `fresh_quota_{k+1} = B - R_k`로 두면 step `k+1` current work size는 `B`로 보존된다. Promoted `Delta_k`는 next-step fresh quota에서 차감하지 않고, source/reservation ledger에서 duplicate emission만 막는다.
-- `old_prefix_token_cap = max_response_length / 8`은 old prefix가 전체 response budget을 과도하게 잠식하는 것을 막는다.
 - 학습 loss의 student side는 항상 current trainer parameter로 forward되므로, stale rollout logprob가 gradient에 직접 들어가지 않는다.
 - SKD teacher correction은 committed assistant token을 teacher top-k tube 안으로 제한한다.
 - 고정 context에서 teacher correction은 raw old/current student proposal TV distance를 증가시키지 않는다.
@@ -840,17 +794,11 @@ Source type:
 - `lookahead/old_gen_chunks_p95`
 - `lookahead/old_gen_chunks_max`
 - `lookahead/old_env_units_hist`
-- `lookahead/old_prefix_tokens_mean`
-- `lookahead/old_prefix_tokens_p95`
-- `lookahead/old_prefix_tokens_max`
 - `lookahead/admission_budget_used`
 - `lookahead/idle_tokens_or_time_filled`
 - `lookahead/drain_wait_ms`
 - `lookahead/resume_count`
 - `lookahead/tool_atomic_pause_count`
-- `lookahead/version_lag_mean`
-- `lookahead/version_lag_max`
-- `lookahead/version_span_max`
 - `lookahead/stale_sample_ratio`
 - `lookahead/stale_token_ratio`
 - `lookahead/logprob_delta_mean`
@@ -899,7 +847,6 @@ mean_{t in assistant positions}
 - lookahead + promote + resume
 - lookahead admission budget sweep
 - `max_old_gen_chunks` sweep
-- `old_prefix_token_ratio` sweep
 
 보고해야 하는 결과:
 
@@ -961,24 +908,7 @@ def advance_one_atomic_unit(sample, version):
 ```python
 def within_old_budget(sample, next_unit, cfg):
     if next_unit == "GEN_CHUNK":
-        return (
-            sample.old_gen_chunks + 1 <= cfg.max_old_gen_chunks
-            and sample.old_prefix_tokens + cfg.skd_chunk_size <= cfg.old_prefix_token_cap
-        )
-
-    if next_unit == "TOOL_STEP":
-        ub = estimate_next_tool_step_token_upper_bound(sample)
-        return (
-            sample.old_env_units + 1 <= cfg.max_old_env_units
-            and sample.old_prefix_tokens + ub <= cfg.old_prefix_token_cap
-        )
-
-    if next_unit == "INTERACT_STEP":
-        ub = estimate_next_interact_step_token_upper_bound(sample)
-        return (
-            sample.old_env_units + 1 <= cfg.max_old_env_units
-            and sample.old_prefix_tokens + ub <= cfg.old_prefix_token_cap
-        )
+        return sample.old_gen_chunks < cfg.max_old_gen_chunks
 
     return True
 ```
@@ -1173,15 +1103,10 @@ Suggested config namespace:
 async_skd_lookahead:
   enable: false
   persistent_rollout_engines: true
-  max_version_lag: 1
-  max_version_span: 1
   prefetch_admission_ratio: 0.25
   prefetch_pair_quota: true
-  max_old_gen_chunks: 2
-  max_old_env_units: 1
-  old_prefix_token_ratio: 0.125
+  max_old_gen_chunks: 16
   promote_finished: true
-  drop_age_gt: 1
   tool_macro_step_atomic: true
   source_aware_metrics: true
 ```
@@ -1190,7 +1115,6 @@ Derived values:
 
 ```text
 L_prefetch = min(B / N_pair, prefetch_admission_ratio * B)
-old_prefix_token_cap = max_response_length * old_prefix_token_ratio
 ```
 
 ### 9.3 Per-Sample Type Discipline
@@ -1708,11 +1632,8 @@ Config:
 
 ```text
 prefetch_admission_budget = min(B / N_pair, 0.25B)
-max_old_gen_chunks = 2
-max_old_env_units = 1
-old_prefix_token_cap = max_response_length / 8
+max_old_gen_chunks = 16
 promote_finished = true
-drop_age_gt = 1
 partial_rollout = false
 ```
 
@@ -1812,7 +1733,7 @@ SKD async path에서는 다음이 필요하다.
 - silent drop 없는 manager-local sample accounting
 - teacher row alignment를 보존하는 partial state
 - tool macro-step atomicity
-- `version_lag <= 1` hard cap
+- committed generation chunk cap
 - `k+2` 이상 prefetch 금지
 
 For the current manager-local design, reuse only the active-task pattern:

@@ -9,7 +9,7 @@
 - 기존 SKD semantics를 보존한다.
 - Tool result와 teacher row alignment를 깨지 않는다.
 - Long trajectory tail에서 생기는 idle GPU를 bounded lookahead로 줄인다.
-- Staleness는 `version_lag <= 1`과 prefix budget으로 강하게 제한한다.
+- Staleness continuation은 committed SKD generation chunk 수로 제한한다.
 - 구현을 함수 단위로 작게 나눠, 각 단계마다 확인 가능한 상태로 닫는다.
 
 비목표는 다음이다.
@@ -48,11 +48,10 @@ teacher row = dummy zero row
 ### 1.2 Staleness
 
 ```text
-version_lag = train_consume_version - rollout_version <= 1
-version_span = rollout_max_version - rollout_min_version <= 1
+committed_gen_chunks < async_skd_max_old_gen_chunks
 ```
 
-`age > 1` sample은 trainer batch에 들어가면 안 된다.
+MVP 기본값은 `async_skd_max_old_gen_chunks = 16`이다.
 
 ### 1.3 Lookahead Admission
 
@@ -248,8 +247,8 @@ agent_data.extra_fields["skd_committed_prefix_tokens"]
 
 왜 필요한가:
 
-- 나중에 partial carryover가 `version_span <= 1`인지 판단해야 한다.
-- Stale prefix budget은 old generation chunks, old env units, old prefix tokens에 의해 판단된다.
+- Partial carryover continuation은 committed generation chunk 수로 판단한다.
+- Env unit, prefix token, version span은 MVP continuation gate에서 제외한다.
 - Tool-call export safety는 Qwen/Hermes EOS-gated parser state에 의해 판단된다.
 
 ### 4.2 Modify `_handle_generating_state()`
@@ -595,7 +594,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
 
 `generate_skd_until_boundary()` is the only worker API that may return partial samples. `generate_sequence_single()` remains completed-only. `generate_skd_from_partial_to_completion()` is also completed-only, but starts from `SkdPartialState` instead of fresh `DataProto`. This separation is intentional: fresh base samples use the single-sample completion path, lookahead samples use the boundary path, and next-step carry-over samples use the partial-to-completion path.
 
-**왜 carry-over는 반드시 완료해야 하는가.** Lookahead sample은 current batch에 포함되기 전의 투기적 실행이므로 pause가 허용된다. 반면 carry-over sample은 `next_current_batch()`가 반환한 시점에 current batch에 편입된다. Trainer는 이 step에서 B개를 학습한다는 전제로 동작하므로, carry-over가 또 pause되면 실제 학습 샘플 수가 B보다 적어지고 배치 예산 불변식이 깨진다. `version_lag <= 1` hard cap은 이 철학의 기술적 결과다. `generate_skd_from_partial_to_completion()`이 완료를 보증한다.
+**왜 carry-over는 반드시 완료해야 하는가.** Lookahead sample은 current batch에 포함되기 전의 투기적 실행이므로 pause가 허용된다. 반면 carry-over sample은 `next_current_batch()`가 반환한 시점에 current batch에 편입된다. Trainer는 이 step에서 B개를 학습한다는 전제로 동작하므로, carry-over가 또 pause되면 실제 학습 샘플 수가 B보다 적어지고 배치 예산 불변식이 깨진다. `generate_skd_from_partial_to_completion()`이 완료를 보증한다.
 
 ### 7.2 Move/Add `generate_sequence_single()`
 
@@ -1191,21 +1190,13 @@ _can_continue_lookahead_partial(partial_state)
 Do not create a new scheduler class for this. The required fields already live in `SkdPartialState`:
 
 ```text
-rollout_min_version
-rollout_max_version
 committed_gen_chunks
-committed_env_units
-committed_prefix_tokens
 ```
 
 The predicate must enforce:
 
 ```text
-committed_gen_chunks <= max_old_gen_chunks
-committed_env_units <= max_old_env_units
-committed_prefix_tokens <= old_prefix_token_cap
-version_span <= max_version_span
-version_lag <= max_version_lag
+committed_gen_chunks < async_skd_max_old_gen_chunks
 ```
 
 ### 13.2 Lookahead Admission During Carry-Over Current Work
@@ -1372,17 +1363,11 @@ metric aggregation path
 ```text
 async_skd/promoted_count
 async_skd/carryover_count
-async_skd/drop_age_gt_1
 async_skd/lookahead_budget_used
 async_skd/intentional_idle_time
-async_skd/version_lag_mean
-async_skd/version_lag_max
-async_skd/version_span_max
 async_skd/stale_sample_ratio
 async_skd/stale_token_ratio
 async_skd/old_gen_chunks_p95
-async_skd/old_env_units_max
-async_skd/old_prefix_tokens_p95
 async_skd/logprob_delta_mean
 async_skd/logprob_delta_p95
 ```
@@ -1426,15 +1411,10 @@ verl/trainer/config/distillation/distillation.yaml
 class AsyncSkdLookaheadConfig(BaseConfig):
     enable: bool = False
     persistent_rollout_engines: bool = True
-    max_version_lag: int = 1
-    max_version_span: int = 1
     prefetch_admission_ratio: float = 0.25
     prefetch_pair_quota: bool = True
-    max_old_gen_chunks: int = 2
-    max_old_env_units: int = 1
-    old_prefix_token_ratio: float = 0.125
+    max_old_gen_chunks: int = 16
     promote_finished: bool = True
-    drop_age_gt: int = 1
     tool_macro_step_atomic: bool = True
     source_aware_metrics: bool = True
 ```
@@ -1460,22 +1440,19 @@ class DistillationConfig:
 ```text
 1. step boundary drain 후 sync
 2. 새 sample admission부터 새 version worker에 배정
-3. active old-version lookahead는 version_lag <= 1 안에서만 carryover 허용
+3. active lookahead는 committed generation chunk cap 안에서만 continuation 허용
 ```
 
-기록해야 할 metadata:
+기록할 수 있는 observability metadata:
 
 ```text
 rollout_min_version
 rollout_max_version
 train_consume_version
-version_lag
-version_span
 ```
 
 왜 필요한가:
 
-- `version_lag <= 1`을 검증한다.
 - Drift metric과 benchmark 해석의 기준이 된다.
 
 Reference:
@@ -1689,8 +1666,8 @@ tests/skd/test_async_skd_manager_lookahead.py
 Changes:
 
 - implement `_can_continue_lookahead_partial()`.
-- read `max_old_gen_chunks`, `max_old_env_units`, `old_prefix_token_ratio`, `max_version_lag`, and `max_version_span`.
-- carry over or drop partials that exceed budget instead of continuing old-version rollout.
+- read `async_skd_max_old_gen_chunks`.
+- carry over partials that reach the chunk budget instead of continuing speculative rollout.
 
 Expected behavior:
 
@@ -1848,8 +1825,7 @@ Changes:
 
 Expected behavior:
 
-- `version_lag <= 1`.
-- `version_span <= 1`.
+- version metadata is available for diagnostics.
 
 Reference:
 
@@ -1929,8 +1905,7 @@ teacher_logprobs
 ### Gate C: Staleness
 
 ```text
-max(version_lag) <= 1
-max(version_span) <= 1
+max(committed_gen_chunks for continued lookahead partials) < async_skd_max_old_gen_chunks
 ```
 
 ### Gate D: Lookahead Accounting
@@ -1970,11 +1945,7 @@ source_type별 tool call count
 
 ```text
 prefetch_admission_ratio = 0.25
-max_version_lag = 1
-max_version_span = 1
-max_old_gen_chunks = 2
-max_old_env_units = 1
-old_prefix_token_ratio = 0.125
+max_old_gen_chunks = 16
 promote_finished = true
 tool_macro_step_atomic = true
 ```
