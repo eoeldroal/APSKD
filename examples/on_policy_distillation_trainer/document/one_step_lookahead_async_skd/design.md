@@ -721,10 +721,13 @@ fresh_cursor
 carryover_partials
 carryover_input_batches
 reserved_input_batches
+promoted_input_batches
 trained_reserved_sample_ids
 ```
 
-`StatefulDataLoader.state_dict()`와 source state를 같은 trainer checkpoint에 묶는 작업은 trainer integration 단계에서 수행한다.
+Trainer checkpoint stores `StatefulDataLoader.state_dict()` and `AsyncSkdDataSource.state_dict()` together in `data.pt`. Legacy checkpoints that contain only dataloader state remain loadable.
+
+The data source receives a continuous dataloader iterator that recreates `iter(self.train_dataloader)` at epoch boundaries, following the existing one-step-off and fully-async iterator pattern. The source object itself is not recreated at each epoch boundary because its carry-over, reserved, and promoted ledgers must survive across epochs.
 
 `AsyncSkdDataSource`와 trainer integration이 지켜야 할 핵심 불변식은 다음이다.
 

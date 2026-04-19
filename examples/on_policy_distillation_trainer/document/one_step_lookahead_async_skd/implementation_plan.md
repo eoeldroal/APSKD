@@ -931,6 +931,8 @@ state_dict()
 load_state_dict(state)
 ```
 
+Trainer integration supplies a continuous iterator to `AsyncSkdDataSource`. The iterator recreates `iter(self.train_dataloader)` at epoch boundaries, matching the existing one-step-off and fully-async code paths. The source object is reused across epochs so carry-over, reserved, and promoted ledgers are preserved.
+
 Manager 결선:
 
 ```text
@@ -949,10 +951,11 @@ fresh_cursor
 carryover_partials
 carryover_input_batches
 reserved_input_batches
+promoted_input_batches
 trained_reserved_sample_ids
 ```
 
-`StatefulDataLoader.state_dict()`와 함께 checkpoint에 저장하고 복원하는 trainer integration은 아직 별도 단계다.
+`StatefulDataLoader.state_dict()`와 함께 checkpoint에 저장하고 복원한다. Legacy `data.pt` files that contain only dataloader state remain supported.
 
 실제 구현 방향:
 
@@ -968,7 +971,7 @@ Rule:
 
 - 전체 dataset이나 전체 dataloader output을 `list()`로 materialize하지 않는다.
 - `StatefulDataLoader.state_dict()`를 기존대로 존중한다.
-- trainer checkpoint에는 dataloader state와 source-local buffer state를 함께 저장한다. 현재 MVP source는 source-local buffer state만 제공한다.
+- trainer checkpoint에는 dataloader state와 source-local buffer state를 함께 저장한다.
 - curriculum sampler가 켜져 있으면 MVP에서는 lookahead를 비활성화한다.
 - `rollout.n != 1`이면 MVP에서는 async SKD lookahead path를 거부한다.
 
@@ -1323,8 +1326,9 @@ New `data.pt` format:
 
 ```python
 {
-    "train_dataloader": train_dataloader_state,
-    "async_skd_source": async_skd_source_state,
+    "format": "async_skd_data_state_v1",
+    "dataloader_state_dict": train_dataloader_state,
+    "async_skd_data_source_state_dict": async_skd_source_state,
 }
 ```
 

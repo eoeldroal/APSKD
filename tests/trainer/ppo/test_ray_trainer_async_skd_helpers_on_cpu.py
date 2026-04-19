@@ -105,6 +105,7 @@ def _make_trainer(
                 }
             },
             "algorithm": {"adv_estimator": adv_estimator},
+            "trainer": {"total_epochs": 2},
         }
     )
     trainer.train_dataloader = _FakeDataLoader(batches or [_batch_dict(0, 2)])
@@ -149,6 +150,86 @@ def test_iter_training_batches_lookahead_uses_async_skd_source_and_binds_manager
     assert fresh_batch.non_tensor_batch["input_pos"].tolist() == [10, 11]
     assert current_input_batch.non_tensor_batch["input_pos"].tolist() == [10, 11]
     assert trainer.async_rollout_manager.source is trainer._async_skd_data_source
+
+
+def test_iter_training_batches_lookahead_continues_across_epoch_calls():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+
+    first_epoch_batches = list(trainer._iter_training_batches())
+    second_epoch_batches = list(trainer._iter_training_batches())
+
+    assert len(first_epoch_batches) == 1
+    assert len(second_epoch_batches) == 1
+    assert first_epoch_batches[0][2].non_tensor_batch["input_pos"].tolist() == [10, 11]
+    assert second_epoch_batches[0][2].non_tensor_batch["input_pos"].tolist() == [10, 11]
+
+
+def test_iter_training_batches_lookahead_preserves_carryover_when_epoch_iterator_advances():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+
+    list(trainer._iter_training_batches())
+    source = trainer._async_skd_data_source
+    source.record_carryover(
+        [_partial("carry-0")],
+        input_batches=[_single_input_row(100, "carry-0")],
+    )
+
+    [(carryover, fresh_batch, current_input_batch)] = list(trainer._iter_training_batches())
+
+    assert [partial.sample_id for partial in carryover] == ["carry-0"]
+    assert fresh_batch is not None
+    assert fresh_batch.non_tensor_batch["input_pos"].tolist() == [10]
+    assert current_input_batch.non_tensor_batch["input_pos"].tolist() == [100, 10]
+
+
+def test_async_skd_checkpoint_payload_preserves_source_state():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(100, 2)])), uid_fn=_UidFactory())
+    source.record_carryover(
+        [_partial("carry-0")],
+        input_batches=[_single_input_row(200, "carry-0")],
+    )
+    trainer._async_skd_data_source = source
+
+    payload = trainer._build_dataloader_checkpoint_state({"loader": "state"})
+    dataloader_state, source_state = trainer._split_dataloader_checkpoint_state(payload)
+
+    assert dataloader_state == {"loader": "state"}
+    assert source_state is not None
+    assert [partial.sample_id for partial in source_state["carryover_partials"]] == ["carry-0"]
+
+
+def test_async_skd_source_state_pending_work_detection():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+    empty_source = AsyncSkdDataSource(iter(_FakeDataLoader([])), uid_fn=_UidFactory())
+    pending_source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(100, 2)])), uid_fn=_UidFactory())
+    pending_source.record_carryover(
+        [_partial("carry-0")],
+        input_batches=[_single_input_row(200, "carry-0")],
+    )
+
+    assert not trainer._async_skd_source_state_has_pending_work(empty_source.state_dict())
+    assert trainer._async_skd_source_state_has_pending_work(pending_source.state_dict())
+
+
+def test_ensure_async_skd_data_source_loads_pending_checkpoint_state():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 2)])
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(100, 2)])), uid_fn=_UidFactory())
+    source.record_carryover(
+        [_partial("carry-0")],
+        input_batches=[_single_input_row(200, "carry-0")],
+    )
+    _, source_state = trainer._split_dataloader_checkpoint_state(
+        trainer._build_dataloader_checkpoint_state({"loader": "state"}, async_skd_source=source)
+    )
+    trainer._async_skd_data_source_state_to_load = source_state
+
+    restored = trainer._ensure_async_skd_data_source()
+
+    carryover, fresh_batch, current_input_batch = restored.next_current_batch(base_batch_size=2)
+    assert [partial.sample_id for partial in carryover] == ["carry-0"]
+    assert fresh_batch is not None
+    assert current_input_batch.non_tensor_batch["input_pos"].tolist() == [200, 10]
 
 
 def test_prepare_async_skd_current_input_batch_matches_fresh_generation_batch_keys():

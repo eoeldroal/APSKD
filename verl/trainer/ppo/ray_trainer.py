@@ -578,15 +578,68 @@ class RayPPOTrainer:
         if not hasattr(self.async_rollout_manager, "set_async_skd_data_source"):
             raise ValueError("async SKD lookahead requires AsyncSkdAgentLoopManager-compatible rollout manager")
 
+    def _create_async_skd_batch_iterator(self):
+        steps_per_epoch = len(self.train_dataloader)
+        global_steps = int(getattr(self, "global_steps", 0))
+        current_epoch = global_steps // steps_per_epoch if steps_per_epoch > 0 else 0
+        total_epochs = int(OmegaConf.select(self.config, "trainer.total_epochs", default=current_epoch + 1))
+        for _ in range(current_epoch, total_epochs):
+            for batch_dict in self.train_dataloader:
+                yield batch_dict
+
     def _ensure_async_skd_data_source(self):
         source = getattr(self, "_async_skd_data_source", None)
         if source is None:
             from verl.experimental.async_skd.data_source import AsyncSkdDataSource
 
-            source = AsyncSkdDataSource(iter(self.train_dataloader))
+            source = AsyncSkdDataSource(self._create_async_skd_batch_iterator())
+            source_state = getattr(self, "_async_skd_data_source_state_to_load", None)
+            if source_state is not None:
+                source.load_state_dict(source_state)
+                self._async_skd_data_source_state_to_load = None
             self._async_skd_data_source = source
             self.async_rollout_manager.set_async_skd_data_source(source)
         return source
+
+    def _build_dataloader_checkpoint_state(
+        self,
+        dataloader_state_dict: dict,
+        *,
+        async_skd_source: Any | None = None,
+    ) -> dict:
+        source = async_skd_source
+        if source is None:
+            source = getattr(self, "_async_skd_data_source", None)
+        if not self._is_async_skd_lookahead_enabled() or source is None:
+            return dataloader_state_dict
+        return {
+            "format": "async_skd_data_state_v1",
+            "dataloader_state_dict": dataloader_state_dict,
+            "async_skd_data_source_state_dict": source.state_dict(),
+        }
+
+    def _split_dataloader_checkpoint_state(self, saved_state: Any) -> tuple[Any, dict | None]:
+        if (
+            isinstance(saved_state, dict)
+            and saved_state.get("format") == "async_skd_data_state_v1"
+            and "dataloader_state_dict" in saved_state
+        ):
+            return saved_state["dataloader_state_dict"], saved_state.get("async_skd_data_source_state_dict")
+        return saved_state, None
+
+    def _async_skd_source_state_has_pending_work(self, source_state: dict | None) -> bool:
+        if not source_state:
+            return False
+        fresh_buffer = source_state.get("fresh_buffer")
+        fresh_cursor = int(source_state.get("fresh_cursor", 0))
+        has_fresh_buffer = fresh_buffer is not None and fresh_cursor < len(fresh_buffer)
+        return bool(
+            has_fresh_buffer
+            or source_state.get("carryover_partials")
+            or source_state.get("carryover_input_batches")
+            or source_state.get("reserved_input_batches")
+            or source_state.get("promoted_input_batches")
+        )
 
     def _append_async_skd_promoted_inputs(self, batch: DataProto) -> DataProto:
         source = getattr(self, "_async_skd_data_source", None)
@@ -1089,6 +1142,7 @@ class RayPPOTrainer:
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
+        dataloader_state_dict = self._build_dataloader_checkpoint_state(dataloader_state_dict)
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
@@ -1159,9 +1213,14 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
+            saved_data_state = torch.load(dataloader_local_path, weights_only=False)
+            dataloader_state_dict, async_skd_source_state = self._split_dataloader_checkpoint_state(saved_data_state)
+            if async_skd_source_state is not None:
+                self._async_skd_data_source_state_to_load = async_skd_source_state
             steps_per_epoch = len(self.train_dataloader)
             at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
-            if at_epoch_boundary:
+            source_has_pending_work = self._async_skd_source_state_has_pending_work(async_skd_source_state)
+            if at_epoch_boundary and not source_has_pending_work:
                 print(
                     f"Skipping dataloader state restore: global_steps={self.global_steps} "
                     f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
@@ -1169,7 +1228,6 @@ class RayPPOTrainer:
                     f"Next epoch will iterate from scratch."
                 )
             else:
-                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
