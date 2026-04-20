@@ -10,7 +10,7 @@ STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-${REPO_ROOT}/checkpoints/Qwen3-1.7B}"
 TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-${REPO_ROOT}/checkpoints/Qwen3-32B-FP8}"
 MATH_VERIFY_REWARD_FN_PATH="${REPO_ROOT}/examples/on_policy_distillation_trainer/reward_fn_math_verify.py"
 TOOL_CONFIG_PATH="${REPO_ROOT}/examples/on_policy_distillation_trainer/config/tool_config/sandbox_fusion_tool_config.yaml"
-TEACHER_SYSTEM_PROMPT_PATH="${TEACHER_SYSTEM_PROMPT_PATH:-${REPO_ROOT}/examples/on_policy_distillation_trainer/config/prompts/teacher_system_prompt_v2.txt}"
+TEACHER_SYSTEM_PROMPT_PATH="${TEACHER_SYSTEM_PROMPT_PATH:-${REPO_ROOT}/examples/on_policy_distillation_trainer/config/prompts/teacher_system_prompt_v1.txt}"
 
 PROJECT_NAME="${PROJECT_NAME:-verl_async_skd_qwen3_math_tool_fsdp}"
 USE_POLICY_GRADIENT="${USE_POLICY_GRADIENT:-False}"

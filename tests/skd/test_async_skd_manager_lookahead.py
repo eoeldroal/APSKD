@@ -576,9 +576,15 @@ async def test_lookahead_refill_does_not_exceed_worker_capacity():
     output = await manager.generate_sequences(_make_prompts(4))
 
     timing = output.meta_info["timing"]
+    metrics = output.meta_info["async_skd_metrics"]
     assert timing["async_skd/worker_capacity"] == 2
     assert timing["async_skd/worker_active_max"] <= 2
     assert timing["async_skd/lookahead_started_count"] == 4
+    assert metrics["async_skd/lookahead_prefetch_limit"] == 4
+    assert metrics["async_skd/lookahead_started_count"] == 4
+    assert metrics["async_skd/lookahead_promoted_count"] == 4
+    assert metrics["async_skd/lookahead_carryover_count"] == 0
+    assert metrics["async_skd/worker_active_max"] <= 2
     assert [call[1] for call in calls].count("lookahead") == 4
 
 
@@ -627,11 +633,14 @@ async def test_lookahead_reports_worker_slot_and_server_distribution_metrics():
 
     output = await manager.generate_sequences(_make_prompts(4))
     timing = output.meta_info["timing"]
+    metrics = output.meta_info["async_skd_metrics"]
 
     assert timing["async_skd/worker_capacity"] == 2
     assert timing["async_skd/lookahead_started_count"] == 2
     assert "async_skd/worker_0_completed_count" in timing
     assert "async_skd/worker_1_completed_count" in timing
+    assert metrics["async_skd/lookahead_promoted_count"] == 2
+    assert metrics["async_skd/lookahead_carryover_count"] == 0
 
 
 @pytest.mark.asyncio

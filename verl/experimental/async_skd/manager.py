@@ -69,6 +69,10 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             timing.update(extra_timing)
             self._async_skd_last_worker_slot_metrics = None
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        extra_metrics = getattr(self, "_async_skd_last_step_metrics", None)
+        if extra_metrics:
+            output.meta_info["async_skd_metrics"] = extra_metrics
+            self._async_skd_last_step_metrics = None
         return output
 
     def _async_skd_mode(self) -> str:
@@ -249,6 +253,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         worker_active_counts = [0 for _ in range(num_workers)]
         worker_completed_counts = [0 for _ in range(num_workers)]
         worker_active_max = 0
+        lookahead_continued_partial_count = 0
 
         def worker_idx_for_order(order: int) -> int:
             return min(order * num_workers // current_count, num_workers - 1)
@@ -357,11 +362,9 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         continue
 
                     partial = sample.require_partial()
-                    if (
-                        not drain_requested
-                        and bool(current_active)
-                        and self._can_continue_lookahead_partial(partial)
-                    ):
+                    can_continue = self._can_continue_lookahead_partial(partial)
+                    if not drain_requested and bool(current_active) and can_continue:
+                        lookahead_continued_partial_count += 1
                         launch_lookahead_partial(partial, admission_order, worker_idx)
                     else:
                         carryover_partials.append((admission_order, partial))
@@ -373,6 +376,23 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         }
         for idx, count in enumerate(worker_completed_counts):
             self._async_skd_last_worker_slot_metrics[f"async_skd/worker_{idx}_completed_count"] = count
+        self._async_skd_last_step_metrics = {
+            "async_skd/lookahead_prefetch_limit": prefetch_limit,
+            "async_skd/lookahead_started_count": lookahead_started_count,
+            "async_skd/lookahead_promoted_count": len(promoted_lookahead),
+            "async_skd/lookahead_carryover_count": len(carryover_partials),
+            "async_skd/lookahead_continued_partial_count": lookahead_continued_partial_count,
+            "async_skd/worker_capacity": worker_capacity,
+            "async_skd/worker_active_max": worker_active_max,
+        }
+        print(
+            "[ASYNC_SKD] rollout "
+            f"prefetch_limit={prefetch_limit} started={lookahead_started_count} "
+            f"promoted={len(promoted_lookahead)} carryover_next={len(carryover_partials)} "
+            f"continued_partial={lookahead_continued_partial_count} "
+            f"worker_capacity={worker_capacity} worker_active_max={worker_active_max}",
+            flush=True,
+        )
         self._async_skd_last_promoted_samples = [
             sample for _, sample in sorted(promoted_lookahead, key=lambda item: item[0])
         ]

@@ -309,6 +309,7 @@ def test_append_async_skd_promoted_inputs_extends_training_batch_once():
     extended = trainer._append_async_skd_promoted_inputs(batch)
 
     assert len(extended) == 4
+    assert trainer._async_skd_last_promoted_rows_appended == 2
     assert extended.non_tensor_batch["uid"].tolist() == ["base-0", "base-1", sample_id_0, sample_id_1]
     assert [item["ground_truth"] for item in extended.non_tensor_batch["reward_model"]] == [
         "0",
@@ -321,3 +322,76 @@ def test_append_async_skd_promoted_inputs_extends_training_batch_once():
     unchanged = trainer._append_async_skd_promoted_inputs(extended)
 
     assert len(unchanged) == 4
+    assert trainer._async_skd_last_promoted_rows_appended == 0
+
+
+def test_record_async_skd_current_batch_metrics_reports_quota_and_row_counts():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(10, 4)])
+    trainer.global_steps = 7
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(10, 4)])), uid_fn=_UidFactory())
+    trainer._async_skd_data_source = source
+    source.record_carryover(
+        [_partial("carry-0")],
+        input_batches=[_single_input_row(100, "carry-0")],
+    )
+    carryover, fresh_batch, current_input_batch = source.next_current_batch(base_batch_size=2)
+    assert fresh_batch is not None
+    assert current_input_batch is not None
+    metrics = {}
+
+    trainer._record_async_skd_current_batch_metrics(
+        metrics,
+        carryover_partials=carryover,
+        fresh_batch=fresh_batch,
+        current_input_batch=current_input_batch,
+    )
+
+    assert metrics["async_skd/current_base_batch_size"] == 2
+    assert metrics["async_skd/current_carryover_count"] == 1
+    assert metrics["async_skd/current_fresh_quota"] == 1
+    assert metrics["async_skd/current_fresh_count"] == 1
+    assert metrics["async_skd/current_input_batch_size"] == 2
+
+
+def test_record_async_skd_post_generation_and_union_metrics():
+    trainer = _make_trainer(mode="lookahead", batches=[_batch_dict(0, 2)])
+    trainer.global_steps = 8
+    source = AsyncSkdDataSource(iter(_FakeDataLoader([_batch_dict(100, 2)])), uid_fn=_UidFactory())
+    trainer._async_skd_data_source = source
+    reserved_0 = source.reserve_lookahead(logical_step=1)
+    reserved_1 = source.reserve_lookahead(logical_step=1)
+    assert reserved_0 is not None and reserved_1 is not None
+    sample_id_0, sample_0 = reserved_0
+    sample_id_1, sample_1 = reserved_1
+    source.record_promoted([
+        _completed(sample_id_0, sample_0),
+        _completed(sample_id_1, sample_1),
+    ])
+    batch = DataProto.from_single_dict(_batch_dict(0, 2))
+    batch.non_tensor_batch["uid"] = np.array(["base-0", "base-1"], dtype=object)
+    trainer._get_gen_batch(batch)
+    gen_batch_output = DataProto.from_dict(
+        tensors={"gen_tensor": torch.arange(4, dtype=torch.long).unsqueeze(-1)},
+        meta_info={"async_skd_metrics": {"async_skd/lookahead_promoted_count": 2}},
+    )
+    metrics = {}
+
+    train_before_union = trainer._record_async_skd_post_generation_metrics(
+        metrics,
+        batch=batch,
+        gen_batch_output=gen_batch_output,
+    )
+    final_batch = train_before_union.union(gen_batch_output)
+    trainer._record_async_skd_union_metrics(
+        metrics,
+        train_batch_before_union=train_before_union,
+        gen_batch_output=gen_batch_output,
+        final_batch=final_batch,
+    )
+
+    assert metrics["async_skd/lookahead_promoted_count"] == 2
+    assert metrics["async_skd/gen_batch_output_size"] == 4
+    assert metrics["async_skd/promoted_rows_appended"] == 2
+    assert metrics["async_skd/train_batch_size_before_union"] == 4
+    assert metrics["async_skd/union_row_delta"] == 0
+    assert metrics["async_skd/final_train_batch_size"] == 4
