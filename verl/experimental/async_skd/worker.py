@@ -201,6 +201,13 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         agent_name: str = "skd_agent",
     ) -> AsyncSkdSample:
         """Resume an SKD partial as current-step work and run it to completion."""
+        print(
+            "[ASYNC_SKD] resume "
+            f"sample_id={partial_state.sample_id} start_chunks={partial_state.committed_gen_chunks} "
+            f"start_resp_len={len(partial_state.response_mask)} "
+            f"start_prefix_tokens={partial_state.committed_prefix_tokens}",
+            flush=True,
+        )
         input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
         sampling_params = self._build_sampling_params(validate=False)
         agent_loop = self._get_or_create_agent_loop(agent_name)

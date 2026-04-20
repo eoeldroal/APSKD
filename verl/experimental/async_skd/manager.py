@@ -367,6 +367,13 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         lookahead_continued_partial_count += 1
                         launch_lookahead_partial(partial, admission_order, worker_idx)
                     else:
+                        print(
+                            "[ASYNC_SKD] carryover "
+                            f"sample_id={partial.sample_id} chunks={partial.committed_gen_chunks} "
+                            f"resp_len={len(partial.response_mask)} prefix_tokens={partial.committed_prefix_tokens} "
+                            f"worker={worker_idx}",
+                            flush=True,
+                        )
                         carryover_partials.append((admission_order, partial))
 
         self._async_skd_last_worker_slot_metrics = {
