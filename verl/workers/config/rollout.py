@@ -103,6 +103,10 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    # Optional async SKD scheduler knobs. They are consumed by AsyncSkdAgentLoopManager/RayPPOTrainer.
+    async_skd_mode: str = "sync"
+    async_skd_prefetch_limit: int = 0
+    async_skd_max_old_gen_chunks: int = 16
 
 
 @dataclass
