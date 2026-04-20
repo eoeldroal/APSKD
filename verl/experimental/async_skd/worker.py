@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 
 
+_ASYNC_SKD_INPUT_NON_TENSOR_BATCH = "async_skd_input_non_tensor_batch"
+
+
 class AsyncSkdAgentLoopWorker(AgentLoopWorker):
     """AgentLoopWorker subclass that owns async-SKD-specific execution primitives."""
 
@@ -59,7 +62,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         return {key: value[:1].copy() for key, value in batch.non_tensor_batch.items()}
 
     def _input_non_tensor_from_partial(self, partial_state: SkdPartialState) -> dict[str, np.ndarray]:
-        saved = partial_state.extra_fields.get("async_skd_input_non_tensor_batch")
+        saved = partial_state.extra_fields.get(_ASYNC_SKD_INPUT_NON_TENSOR_BATCH)
         if saved is None:
             raw_prompt = partial_state.extra_fields.get("raw_prompt", partial_state.messages)
             return {
@@ -67,6 +70,9 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
                 "agent_name": np.array(["skd_agent"], dtype=object),
             }
         return {key: np.asarray(value, dtype=object) for key, value in saved.items()}
+
+    def _strip_internal_async_skd_extra_fields(self, output: AgentLoopOutput) -> None:
+        output.extra_fields.pop(_ASYNC_SKD_INPUT_NON_TENSOR_BATCH, None)
 
     async def generate_sequence_single(self, batch: DataProto) -> DataProto:
         """Generate one sequence from agent loop without changing the batched API contract.
@@ -173,12 +179,13 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
 
         if isinstance(result, SkdPartialState):
             if batch is not None:
-                result.extra_fields["async_skd_input_non_tensor_batch"] = deepcopy(input_non_tensor_batch)
+                result.extra_fields[_ASYNC_SKD_INPUT_NON_TENSOR_BATCH] = deepcopy(input_non_tensor_batch)
             return AsyncSkdSample.from_partial(partial_state=result)
 
         if not isinstance(result, AgentLoopOutput):
             raise TypeError(f"Unexpected SKD boundary result type: {type(result).__name__}")
 
+        self._strip_internal_async_skd_extra_fields(result)
         postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
         internal_output = await self._agent_loop_postprocess(result, validate, **postprocess_kwargs)
         completed_batch = self._postprocess(
@@ -223,6 +230,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             sampling_params,
             partial_state=partial_state,
         )
+        self._strip_internal_async_skd_extra_fields(result)
         postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
         internal_output = await self._agent_loop_postprocess(result, False, **postprocess_kwargs)
         completed_batch = self._postprocess(

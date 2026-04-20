@@ -26,6 +26,16 @@ def _object_array(values: list[Any]) -> np.ndarray:
     return array
 
 
+def _saved_input_non_tensor_batch() -> dict[str, np.ndarray]:
+    raw_prompt = [{"role": "user", "content": "hi"}]
+    return {
+        "raw_prompt": _object_array([raw_prompt]),
+        "index": np.array([7], dtype=object),
+        "agent_name": np.array(["skd_agent"], dtype=object),
+        "reward_model": np.array([{"ground_truth": "42"}], dtype=object),
+    }
+
+
 def make_single_batch() -> DataProto:
     raw_prompt = [{"role": "user", "content": "hi"}]
     return DataProto.from_dict(
@@ -72,12 +82,7 @@ def make_partial() -> SkdPartialState:
             "rollout_min_version": 7,
             "rollout_max_version": 7,
             "raw_prompt": raw_prompt,
-            "async_skd_input_non_tensor_batch": {
-                "raw_prompt": _object_array([raw_prompt]),
-                "index": np.array([7], dtype=object),
-                "agent_name": np.array(["skd_agent"], dtype=object),
-                "reward_model": np.array([{"ground_truth": "42"}], dtype=object),
-            },
+            "async_skd_input_non_tensor_batch": _saved_input_non_tensor_batch(),
         },
     )
 
@@ -199,6 +204,7 @@ async def test_generate_skd_until_boundary_wraps_completed_result_from_partial_s
     assert len(batch) == 1
     assert batch.non_tensor_batch["index"].tolist() == [7]
     assert batch.non_tensor_batch["reward_model"][0] == {"ground_truth": "42"}
+    assert "async_skd_input_non_tensor_batch" not in batch.non_tensor_batch
     assert batch.batch["responses"].shape == (1, 4)
     assert worker.loop.calls[0]["partial_state"] is partial
 
@@ -224,9 +230,31 @@ async def test_generate_skd_from_partial_to_completion_returns_completed_resumed
     batch = result.require_completed()
     assert batch.non_tensor_batch["index"].tolist() == [7]
     assert batch.non_tensor_batch["reward_model"][0] == {"ground_truth": "42"}
+    assert "async_skd_input_non_tensor_batch" not in batch.non_tensor_batch
     assert batch.batch["responses"].shape == (1, 4)
     assert worker.loop.calls[0]["partial_state"] is partial
     assert worker.loop.calls[0]["completion"] is True
+
+
+@pytest.mark.asyncio
+async def test_completed_resumed_partial_does_not_leak_internal_input_snapshot_key():
+    output = AgentLoopOutput(
+        prompt_ids=[1, 2, 3],
+        response_ids=[10, 20],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "turn_scores": [],
+            "tool_rewards": [],
+            "async_skd_input_non_tensor_batch": _saved_input_non_tensor_batch(),
+        },
+    )
+    worker = _DummyWorker(output)
+
+    result = await worker.generate_skd_from_partial_to_completion(make_partial())
+
+    assert result.kind == "completed"
+    assert "async_skd_input_non_tensor_batch" not in result.require_completed().non_tensor_batch
 
 
 @pytest.mark.asyncio
