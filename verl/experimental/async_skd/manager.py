@@ -295,6 +295,13 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             )
             lookahead_active[task] = (admission_order, worker_idx)
             note_launch(worker_idx)
+            print(
+                "[ASYNC_SKD] prefetch_start "
+                f"sample_id={sample_id} admission_order={admission_order} "
+                f"worker={worker_idx} active_on_worker={worker_active_counts[worker_idx]} "
+                f"worker_capacity={worker_capacity}",
+                flush=True,
+            )
 
         def launch_lookahead_partial(partial_state: SkdPartialState, admission_order: int, worker_idx: int) -> None:
             worker = worker_for_idx(worker_idx)
@@ -344,7 +351,14 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     else:
                         current_completed[order] = result
                     worker_completed_counts[worker_idx] += 1
-                    if not current_active:
+                    if not current_active and not drain_requested:
+                        print(
+                            "[ASYNC_SKD] drain_start "
+                            f"completed_current={current_count} lookahead_active={len(lookahead_active)} "
+                            f"started={lookahead_started_count} promoted={len(promoted_lookahead)} "
+                            f"carryover_next={len(carryover_partials)}",
+                            flush=True,
+                        )
                         drain_requested = True
                     try_admit_lookahead(worker_idx)
 
@@ -367,9 +381,18 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         lookahead_continued_partial_count += 1
                         launch_lookahead_partial(partial, admission_order, worker_idx)
                     else:
+                        if drain_requested:
+                            carryover_reason = "drain"
+                        elif not current_active:
+                            carryover_reason = "no_current"
+                        elif not can_continue:
+                            carryover_reason = "stale_cap"
+                        else:
+                            carryover_reason = "unknown"
                         print(
                             "[ASYNC_SKD] carryover "
-                            f"sample_id={partial.sample_id} chunks={partial.committed_gen_chunks} "
+                            f"sample_id={partial.sample_id} reason={carryover_reason} "
+                            f"chunks={partial.committed_gen_chunks} "
                             f"resp_len={len(partial.response_mask)} prefix_tokens={partial.committed_prefix_tokens} "
                             f"worker={worker_idx}",
                             flush=True,
