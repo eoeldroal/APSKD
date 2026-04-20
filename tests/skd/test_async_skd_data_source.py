@@ -163,7 +163,7 @@ def test_data_source_reserves_lookahead_and_records_promoted_without_reducing_fr
     assert sample_id in source.trained_reserved_sample_ids
 
 
-def test_data_source_returns_promoted_input_rows_once_in_promoted_order():
+def test_data_source_returns_promoted_input_output_pairs_with_limit_in_order():
     source = AsyncSkdDataSource(_BatchIterator([_batch_dict(0, 4)]), uid_fn=_UidFactory())
 
     reserved_0 = source.reserve_lookahead(logical_step=1)
@@ -177,11 +177,18 @@ def test_data_source_returns_promoted_input_rows_once_in_promoted_order():
         _completed(sample_id_1, sample_1),
     ])
 
-    promoted_inputs = source.pop_promoted_input_batches()
+    promoted_inputs, promoted_outputs = source.pop_promoted_pairs(max_count=1)
 
-    assert [batch.non_tensor_batch["uid"].tolist()[0] for batch in promoted_inputs] == [sample_id_0, sample_id_1]
-    assert [batch.non_tensor_batch["input_pos"].tolist()[0] for batch in promoted_inputs] == [0, 1]
-    assert source.pop_promoted_input_batches() == []
+    assert [batch.non_tensor_batch["uid"].tolist()[0] for batch in promoted_inputs] == [sample_id_0]
+    assert [batch.non_tensor_batch["input_pos"].tolist()[0] for batch in promoted_inputs] == [0]
+    assert [batch.non_tensor_batch["uid"].tolist()[0] for batch in promoted_outputs] == [sample_id_0]
+    assert [batch.non_tensor_batch["input_pos"].tolist()[0] for batch in promoted_outputs] == [0]
+
+    promoted_inputs, promoted_outputs = source.pop_promoted_pairs(max_count=8)
+
+    assert [batch.non_tensor_batch["uid"].tolist()[0] for batch in promoted_inputs] == [sample_id_1]
+    assert [batch.non_tensor_batch["input_pos"].tolist()[0] for batch in promoted_outputs] == [1]
+    assert source.pop_promoted_pairs(max_count=8) == ([], [])
 
 
 def test_data_source_state_dict_restores_fresh_buffer_and_ledgers():
@@ -207,7 +214,7 @@ def test_data_source_state_dict_restores_fresh_buffer_and_ledgers():
     assert current_input.non_tensor_batch["input_pos"].tolist() == [100, 2]
 
 
-def test_data_source_state_dict_restores_unconsumed_promoted_input_rows():
+def test_data_source_state_dict_restores_unconsumed_promoted_pairs():
     source = AsyncSkdDataSource(_BatchIterator([_batch_dict(0, 2)]), uid_fn=_UidFactory())
     reserved = source.reserve_lookahead(logical_step=1)
     assert reserved is not None
@@ -217,8 +224,11 @@ def test_data_source_state_dict_restores_unconsumed_promoted_input_rows():
     restored = AsyncSkdDataSource(_BatchIterator([]), uid_fn=_UidFactory())
     restored.load_state_dict(source.state_dict())
 
-    promoted_inputs = restored.pop_promoted_input_batches()
+    promoted_inputs, promoted_outputs = restored.pop_promoted_pairs(max_count=1)
 
     assert len(promoted_inputs) == 1
+    assert len(promoted_outputs) == 1
     assert promoted_inputs[0].non_tensor_batch["uid"].tolist() == [sample_id]
     assert promoted_inputs[0].non_tensor_batch["input_pos"].tolist() == [0]
+    assert promoted_outputs[0].non_tensor_batch["uid"].tolist() == [sample_id]
+    assert promoted_outputs[0].non_tensor_batch["input_pos"].tolist() == [0]

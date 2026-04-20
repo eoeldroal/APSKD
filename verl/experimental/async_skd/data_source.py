@@ -29,6 +29,7 @@ class AsyncSkdDataSource:
         self._carryover_input_batches: list[DataProto] = []
         self._reserved_input_batches: dict[str, DataProto] = {}
         self._promoted_input_batches: list[DataProto] = []
+        self._promoted_output_batches: list[DataProto] = []
         self._trained_reserved_sample_ids: set[str] = set()
 
     @property
@@ -78,19 +79,36 @@ class AsyncSkdDataSource:
         return sample_id, sample
 
     def record_promoted(self, samples: list[AsyncSkdSample]) -> None:
-        """Record promoted lookahead samples as already trained reserved samples."""
+        """Record completed lookahead samples as pending train input/output pairs."""
         for sample in samples:
-            sample.require_completed()
+            output_batch = sample.require_completed()
             self._trained_reserved_sample_ids.add(sample.sample_id)
             input_batch = self._reserved_input_batches.pop(sample.sample_id, None)
             if input_batch is not None:
                 self._promoted_input_batches.append(copy.deepcopy(input_batch))
+                self._promoted_output_batches.append(copy.deepcopy(output_batch))
 
-    def pop_promoted_input_batches(self) -> list[DataProto]:
-        """Return promoted input rows once, in the same order as recorded promoted outputs."""
-        promoted_inputs = self._promoted_input_batches
-        self._promoted_input_batches = []
-        return promoted_inputs
+    def promoted_count(self) -> int:
+        if len(self._promoted_input_batches) != len(self._promoted_output_batches):
+            raise ValueError(
+                "promoted input/output batch count must match: "
+                f"{len(self._promoted_input_batches)} != {len(self._promoted_output_batches)}"
+            )
+        return len(self._promoted_input_batches)
+
+    def pop_promoted_pairs(self, max_count: int | None = None) -> tuple[list[DataProto], list[DataProto]]:
+        """Return pending promoted input/output pairs in FIFO order."""
+        promoted_count = self.promoted_count()
+        if max_count is None:
+            take_count = promoted_count
+        else:
+            take_count = max(0, min(int(max_count), promoted_count))
+
+        promoted_inputs = self._promoted_input_batches[:take_count]
+        promoted_outputs = self._promoted_output_batches[:take_count]
+        self._promoted_input_batches = self._promoted_input_batches[take_count:]
+        self._promoted_output_batches = self._promoted_output_batches[take_count:]
+        return promoted_inputs, promoted_outputs
 
     def record_carryover(
         self,
@@ -169,6 +187,7 @@ class AsyncSkdDataSource:
             "carryover_input_batches": copy.deepcopy(self._carryover_input_batches),
             "reserved_input_batches": copy.deepcopy(self._reserved_input_batches),
             "promoted_input_batches": copy.deepcopy(self._promoted_input_batches),
+            "promoted_output_batches": copy.deepcopy(self._promoted_output_batches),
             "trained_reserved_sample_ids": sorted(self._trained_reserved_sample_ids),
         }
 
@@ -179,4 +198,5 @@ class AsyncSkdDataSource:
         self._carryover_input_batches = copy.deepcopy(state.get("carryover_input_batches", []))
         self._reserved_input_batches = copy.deepcopy(state.get("reserved_input_batches", {}))
         self._promoted_input_batches = copy.deepcopy(state.get("promoted_input_batches", []))
+        self._promoted_output_batches = copy.deepcopy(state.get("promoted_output_batches", []))
         self._trained_reserved_sample_ids = set(state.get("trained_reserved_sample_ids", []))

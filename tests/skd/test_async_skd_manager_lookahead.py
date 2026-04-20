@@ -312,7 +312,7 @@ async def test_manager_generate_sequences_with_carryover_rejects_rollout_n_great
 
 
 @pytest.mark.asyncio
-async def test_carryover_path_admits_lookahead_and_appends_promoted_after_current_work():
+async def test_carryover_path_records_promoted_for_trainer_append():
     manager, calls, source = _make_manager(
         prefetch_limit=2,
         source_items=[
@@ -333,7 +333,7 @@ async def test_carryover_path_admits_lookahead_and_appends_promoted_after_curren
         carryover_partials=[_make_partial("carry-200"), _make_partial("carry-201")],
     )
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [200, 201, 0, 1, 100, 101]
+    assert output.non_tensor_batch["input_pos"].tolist() == [200, 201, 0, 1]
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100", "lookahead-101"]
     assert source.carryover_partials == []
     assert [call[1] for call in calls].count("lookahead") == 2
@@ -369,7 +369,7 @@ async def test_carryover_path_drain_stops_lookahead_refill():
 
 
 @pytest.mark.asyncio
-async def test_lookahead_manager_promotes_completed_samples_after_base_outputs():
+async def test_lookahead_manager_records_completed_promotions_without_appending_outputs():
     manager, calls, source = _make_manager(
         prefetch_limit=2,
         source_items=[
@@ -384,14 +384,12 @@ async def test_lookahead_manager_promotes_completed_samples_after_base_outputs()
 
     output = await manager.generate_sequences(_make_prompts(4))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 100, 101]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
     assert output.non_tensor_batch["payload"].tolist() == [
         "out-0",
         "out-1",
         "out-2",
         "out-3",
-        "out-100",
-        "out-101",
     ]
     assert manager._async_skd_carryover_partials == []
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100", "lookahead-101"]
@@ -415,7 +413,7 @@ async def test_lookahead_manager_carries_partial_and_excludes_it_from_train_batc
 
     output = await manager.generate_sequences(_make_prompts(4))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 101]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
     assert [partial.sample_id for partial in manager._async_skd_carryover_partials] == ["lookahead-100"]
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-101"]
     assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]
@@ -454,7 +452,7 @@ async def test_lookahead_manager_can_continue_partial_before_base_barrier_withou
 
     output = await manager.generate_sequences(_make_prompts(2))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 100]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
     assert manager._async_skd_carryover_partials == []
     assert [call[1] for call in calls].count("lookahead") == 1
     assert [call[1] for call in calls].count("resume") == 1
@@ -462,7 +460,7 @@ async def test_lookahead_manager_can_continue_partial_before_base_barrier_withou
 
 
 @pytest.mark.asyncio
-async def test_lookahead_manager_carries_partial_at_default_old_gen_chunk_cap():
+async def test_lookahead_manager_continues_partial_until_base_barrier_without_chunk_cap():
     manager, calls, source = _make_manager(
         prefetch_limit=1,
         source_items=[("lookahead-100", _make_source_sample(100))],
@@ -478,9 +476,10 @@ async def test_lookahead_manager_carries_partial_at_default_old_gen_chunk_cap():
     output = await manager.generate_sequences(_make_prompts(2))
 
     assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
-    assert [partial.sample_id for partial in manager._async_skd_carryover_partials] == ["lookahead-100"]
-    assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]
-    assert [call for call in calls if call[1] == "resume"] == []
+    assert manager._async_skd_carryover_partials == []
+    assert source.carryover_partials == []
+    assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100"]
+    assert [call[1] for call in calls].count("resume") == 1
 
 
 @pytest.mark.asyncio
@@ -499,7 +498,7 @@ async def test_lookahead_manager_records_source_promoted_and_carryover_samples()
 
     output = await manager.generate_sequences(_make_prompts(4))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 100]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
     assert source.reserved_steps == [4, 4]
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100"]
     assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-101"]
@@ -551,7 +550,7 @@ async def test_lookahead_refills_the_worker_that_frees_a_slot_first():
         "lookahead-102",
         "lookahead-103",
     ]
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 100, 101, 102, 103]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
 
 
 @pytest.mark.asyncio

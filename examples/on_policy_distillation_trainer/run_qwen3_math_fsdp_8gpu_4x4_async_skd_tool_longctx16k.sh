@@ -39,12 +39,11 @@ ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.80}"
 SKD_CHUNK_SIZE=64
 SKD_VERIFY_TOP_K="${SKD_VERIFY_TOP_K:-3}"
 SKD_MAX_CHUNKS="${SKD_MAX_CHUNKS:-256}"
-ASYNC_SKD_MAX_OLD_GEN_CHUNKS=64
 
 DISTILLATION_LOSS_MAX_CLAMP="${DISTILLATION_LOSS_MAX_CLAMP:-10.0}"
 DISTILLATION_LOG_PROB_MIN_CLAMP="${DISTILLATION_LOG_PROB_MIN_CLAMP:--10.0}"
 
-EXP_NAME="${EXPERIMENT_NAME:-fsdp/student-Qwen3-1.7B/teacher-Qwen3-32B-FP8/train-nemotron-cascade-rl-math/loss-${DISTILLATION_LOSS_MODE}/pg-${USE_POLICY_GRADIENT}/8gpu-4x4-async-skd-tool-longctx16k-b${TRAIN_PROMPT_BSZ}-prefetch${PREFETCH_LIMIT}-chunk${SKD_CHUNK_SIZE}-oldchunks${ASYNC_SKD_MAX_OLD_GEN_CHUNKS}-topk${SKD_VERIFY_TOP_K}-maxchunks${SKD_MAX_CHUNKS}}"
+EXP_NAME="${EXPERIMENT_NAME:-fsdp/student-Qwen3-1.7B/teacher-Qwen3-32B-FP8/train-nemotron-cascade-rl-math/loss-${DISTILLATION_LOSS_MODE}/pg-${USE_POLICY_GRADIENT}/8gpu-4x4-async-skd-tool-longctx16k-b${TRAIN_PROMPT_BSZ}-prefetch${PREFETCH_LIMIT}-chunk${SKD_CHUNK_SIZE}-topk${SKD_VERIFY_TOP_K}-maxchunks${SKD_MAX_CHUNKS}}"
 CHECKPOINT_ROOT="${REPO_ROOT}/checkpoints/${PROJECT_NAME}/${EXP_NAME}"
 DUMP_ROOT="${CHECKPOINT_ROOT}/dumps"
 ROLLOUT_DUMP_DIR="${DUMP_ROOT}/rollout"
@@ -131,7 +130,6 @@ ROLLOUT=(
     +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager
     +actor_rollout_ref.rollout.agent.async_skd_mode=lookahead
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=$PREFETCH_LIMIT
-    +actor_rollout_ref.rollout.agent.async_skd_max_old_gen_chunks=$ASYNC_SKD_MAX_OLD_GEN_CHUNKS
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$STUDENT_MAX_TOKEN_LEN_PER_GPU
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=$USE_DYNAMIC_BSZ
     actor_rollout_ref.rollout.tensor_model_parallel_size=1

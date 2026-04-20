@@ -639,15 +639,16 @@ class RayPPOTrainer:
             or source_state.get("carryover_input_batches")
             or source_state.get("reserved_input_batches")
             or source_state.get("promoted_input_batches")
+            or source_state.get("promoted_output_batches")
         )
 
     def _append_async_skd_promoted_inputs(self, batch: DataProto) -> DataProto:
         self._async_skd_last_promoted_rows_appended = 0
         source = getattr(self, "_async_skd_data_source", None)
-        if source is None or not hasattr(source, "pop_promoted_input_batches"):
+        if source is None or not hasattr(source, "pop_promoted_pairs"):
             return batch
 
-        promoted_inputs = source.pop_promoted_input_batches()
+        promoted_inputs, _ = source.pop_promoted_pairs()
         if not promoted_inputs:
             return batch
 
@@ -659,6 +660,24 @@ class RayPPOTrainer:
 
         self._async_skd_last_promoted_rows_appended = len(train_ready_promoted_inputs)
         return DataProto.concat([batch] + train_ready_promoted_inputs)
+
+    def _async_skd_appendable_promoted_count(self, *, current_rows: int, promoted_available: int) -> int:
+        if promoted_available <= 0:
+            return 0
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        remainder = (current_rows + promoted_available) % dp_size
+        return max(0, promoted_available - remainder)
+
+    def _actor_update_batch_controls(self, *, batch_size: int, ppo_mini_batch_size: int) -> dict[str, Any]:
+        if self._is_async_skd_lookahead_enabled():
+            return {
+                "global_batch_size": int(batch_size),
+                "num_mini_batch": 1,
+            }
+        return {
+            "global_batch_size": ppo_mini_batch_size,
+            "mini_batch_size": ppo_mini_batch_size,
+        }
 
     def _record_async_skd_current_batch_metrics(
         self,
@@ -699,24 +718,42 @@ class RayPPOTrainer:
         *,
         batch: DataProto,
         gen_batch_output: DataProto,
-    ) -> DataProto:
+    ) -> tuple[DataProto, DataProto]:
         if not self._is_async_skd_lookahead_enabled():
-            return batch
+            return batch, gen_batch_output
 
         rollout_metrics = gen_batch_output.meta_info.pop("async_skd_metrics", None)
         if rollout_metrics:
             metrics.update(rollout_metrics)
 
-        gen_output_rows = len(gen_batch_output)
-        batch = self._append_async_skd_promoted_inputs(batch)
-        promoted_rows_appended = int(getattr(self, "_async_skd_last_promoted_rows_appended", 0))
+        source = getattr(self, "_async_skd_data_source", None)
+        promoted_available = int(source.promoted_count()) if source is not None and hasattr(source, "promoted_count") else 0
+        promoted_append_count = self._async_skd_appendable_promoted_count(
+            current_rows=len(batch),
+            promoted_available=promoted_available,
+        )
+        promoted_inputs: list[DataProto] = []
+        promoted_outputs: list[DataProto] = []
+        if promoted_append_count > 0 and source is not None and hasattr(source, "pop_promoted_pairs"):
+            promoted_inputs, promoted_outputs = source.pop_promoted_pairs(max_count=promoted_append_count)
+            train_ready_promoted_inputs = []
+            for promoted_input in promoted_inputs:
+                self._ensure_batch_uid(promoted_input)
+                self._get_gen_batch(promoted_input)
+                train_ready_promoted_inputs.append(promoted_input)
+            batch = DataProto.concat([batch] + train_ready_promoted_inputs)
+            gen_batch_output = DataProto.concat([gen_batch_output] + promoted_outputs)
+
+        promoted_rows_appended = len(promoted_inputs)
+        promoted_rows_pending = promoted_available - promoted_rows_appended
         metrics.update(
             {
-                "async_skd/gen_batch_output_size": gen_output_rows,
+                "async_skd/gen_batch_output_size": len(gen_batch_output),
                 "async_skd/promoted_rows_appended": promoted_rows_appended,
+                "async_skd/promoted_rows_pending": promoted_rows_pending,
             }
         )
-        return batch
+        return batch, gen_batch_output
 
     def _record_async_skd_union_metrics(
         self,
@@ -1528,12 +1565,15 @@ class RayPPOTrainer:
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
+            batch_controls = self._actor_update_batch_controls(
+                batch_size=batch_td.batch_size[0],
+                ppo_mini_batch_size=ppo_mini_batch_size,
+            )
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
                 distillation_use_topk=distillation_use_topk,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
+                **batch_controls,
                 epochs=ppo_epochs,
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
@@ -1701,7 +1741,7 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-                        batch = self._record_async_skd_post_generation_metrics(
+                        batch, gen_batch_output = self._record_async_skd_post_generation_metrics(
                             metrics,
                             batch=batch,
                             gen_batch_output=gen_batch_output,

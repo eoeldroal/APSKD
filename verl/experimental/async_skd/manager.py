@@ -95,22 +95,11 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         )
         return max(0, min(int(value), batch_size))
 
-    def _lookahead_max_old_gen_chunks(self) -> int:
-        value = OmegaConf.select(
-            self.config,
-            "actor_rollout_ref.rollout.agent.async_skd_max_old_gen_chunks",
-            default=16,
-        )
-        return max(0, int(value))
-
     def _next_lookahead_sample(self, logical_step: int) -> tuple[str, DataProto] | None:
         source = self._get_async_skd_data_source()
         if source is None:
             return None
         return source.reserve_lookahead(logical_step)
-
-    def _can_continue_lookahead_partial(self, partial_state: SkdPartialState) -> bool:
-        return partial_state.committed_gen_chunks < self._lookahead_max_old_gen_chunks()
 
     def _next_fresh_quota(self, base_batch_size: int) -> int:
         source = self._get_async_skd_data_source()
@@ -376,8 +365,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         continue
 
                     partial = sample.require_partial()
-                    can_continue = self._can_continue_lookahead_partial(partial)
-                    if not drain_requested and bool(current_active) and can_continue:
+                    if not drain_requested and bool(current_active):
                         lookahead_continued_partial_count += 1
                         launch_lookahead_partial(partial, admission_order, worker_idx)
                     else:
@@ -385,8 +373,6 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                             carryover_reason = "drain"
                         elif not current_active:
                             carryover_reason = "no_current"
-                        elif not can_continue:
-                            carryover_reason = "stale_cap"
                         else:
                             carryover_reason = "unknown"
                         print(
@@ -434,5 +420,4 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             source.record_promoted(self._async_skd_last_promoted_samples)
             source.record_carryover(self._async_skd_carryover_partials)
 
-        promoted_outputs = [sample.require_completed() for sample in self._async_skd_last_promoted_samples]
-        return [output for output in current_completed if output is not None] + promoted_outputs
+        return [output for output in current_completed if output is not None]
