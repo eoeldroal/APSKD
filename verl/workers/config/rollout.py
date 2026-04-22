@@ -106,6 +106,7 @@ class AgentLoopConfig(BaseConfig):
     # Optional async SKD scheduler knobs. They are consumed by AsyncSkdAgentLoopManager/RayPPOTrainer.
     async_skd_mode: str = "sync"
     async_skd_prefetch_limit: int = 0
+    async_skd_prefetch_worker_target: int = 0
 
 
 @dataclass

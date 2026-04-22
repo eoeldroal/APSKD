@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from typing import Any
 
 from omegaconf import OmegaConf
 import ray
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
@@ -64,10 +66,6 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         output = DataProto.concat(outputs)
         metrics = [single.meta_info.pop("metrics") for single in outputs]
         timing = self._performance_metrics(metrics, output)
-        extra_timing = getattr(self, "_async_skd_last_worker_slot_metrics", None)
-        if extra_timing:
-            timing.update(extra_timing)
-            self._async_skd_last_worker_slot_metrics = None
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         extra_metrics = getattr(self, "_async_skd_last_step_metrics", None)
         if extra_metrics:
@@ -94,6 +92,17 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             default=0,
         )
         return max(0, min(int(value), batch_size))
+
+    def _lookahead_prefetch_worker_target(self, worker_capacity: int) -> int:
+        value = OmegaConf.select(
+            self.config,
+            "actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target",
+            default=0,
+        )
+        target = int(value)
+        if target <= 0:
+            return worker_capacity
+        return max(1, min(target, worker_capacity))
 
     def _next_lookahead_sample(self, logical_step: int) -> tuple[str, DataProto] | None:
         source = self._get_async_skd_data_source()
@@ -233,14 +242,14 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         current_completed: list[DataProto | None] = [None] * current_count
         promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
         carryover_partials: list[tuple[int, SkdPartialState]] = []
-        current_active: dict[asyncio.Task, tuple[int, int]] = {}
-        lookahead_active: dict[asyncio.Task, tuple[int, int]] = {}
+        current_active: dict[asyncio.Task, dict[str, Any]] = {}
+        lookahead_active: dict[asyncio.Task, dict[str, Any]] = {}
         lookahead_started_count = 0
         drain_requested = False
         num_workers = len(self.agent_loop_workers)
         worker_capacity = max(1, math.ceil(current_count / num_workers))
+        prefetch_worker_target = self._lookahead_prefetch_worker_target(worker_capacity)
         worker_active_counts = [0 for _ in range(num_workers)]
-        worker_completed_counts = [0 for _ in range(num_workers)]
         worker_active_max = 0
         lookahead_continued_partial_count = 0
 
@@ -250,27 +259,73 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         def worker_for_idx(worker_idx: int) -> Any:
             return self.agent_loop_workers[worker_idx]
 
-        def note_launch(worker_idx: int) -> None:
+        def note_launch(worker_idx: int) -> int:
             nonlocal worker_active_max
             worker_active_counts[worker_idx] += 1
             worker_active_max = max(worker_active_max, max(worker_active_counts))
+            return worker_active_counts[worker_idx]
 
-        def note_finish(worker_idx: int) -> None:
+        def note_finish(worker_idx: int) -> int:
             worker_active_counts[worker_idx] -= 1
             if worker_active_counts[worker_idx] < 0:
                 raise RuntimeError(f"worker_active_counts[{worker_idx}] became negative")
+            return worker_active_counts[worker_idx]
+
+        def sample_id_for_current(kind: str, order: int, payload: Any) -> str:
+            if kind == "carryover":
+                return str(payload.sample_id)
+            if isinstance(payload, DataProto):
+                for key in ("uid", "index", "input_pos"):
+                    if key in payload.non_tensor_batch:
+                        return str(payload.non_tensor_batch[key][0])
+            return f"current-{logical_step}-{order}"
 
         def launch_current(kind: str, order: int, payload: Any) -> None:
             worker_idx = worker_idx_for_order(order)
             worker = worker_for_idx(worker_idx)
+            sample_id = sample_id_for_current(kind, order, payload)
+            source_type = "resumed_current" if kind == "carryover" else "base_current"
+            event_context = {
+                "global_step": logical_step,
+                "logical_step": logical_step,
+                "sample_id": sample_id,
+                "scheduler_worker_idx": worker_idx,
+                "order": order,
+                "source_type": source_type,
+                "barrier_role": "current",
+                "worker_capacity": worker_capacity,
+            }
             if kind == "fresh":
-                task = asyncio.ensure_future(worker.generate_sequence_single.remote(payload))
+                task = asyncio.ensure_future(
+                    worker.generate_sequence_single.remote(payload, async_skd_context=event_context)
+                )
             elif kind == "carryover":
-                task = asyncio.ensure_future(worker.generate_skd_from_partial_to_completion.remote(payload))
+                task = asyncio.ensure_future(
+                    worker.generate_skd_from_partial_to_completion.remote(payload, async_skd_context=event_context)
+                )
             else:
                 raise ValueError(f"Unsupported async SKD current work kind: {kind!r}")
-            current_active[task] = (order, worker_idx)
-            note_launch(worker_idx)
+            active_after = note_launch(worker_idx)
+            current_active[task] = {
+                "order": order,
+                "worker_idx": worker_idx,
+                "sample_id": sample_id,
+                "source_type": source_type,
+                "barrier_role": "current",
+                "launch_ts": time.time(),
+            }
+            emit_async_skd_event(
+                "sample_launch",
+                global_step=logical_step,
+                logical_step=logical_step,
+                sample_id=sample_id,
+                scheduler_worker_idx=worker_idx,
+                order=order,
+                source_type=source_type,
+                barrier_role="current",
+                worker_active_after=active_after,
+                worker_capacity=worker_capacity,
+            )
 
         def launch_lookahead_batch(sample_id: str, sample: DataProto, admission_order: int, worker_idx: int) -> None:
             worker = worker_for_idx(worker_idx)
@@ -280,15 +335,62 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     sample_id=sample_id,
                     logical_step=logical_step,
                     source_type="lookahead",
+                    async_skd_context={
+                        "global_step": logical_step,
+                        "logical_step": logical_step,
+                        "sample_id": sample_id,
+                        "scheduler_worker_idx": worker_idx,
+                        "order": admission_order,
+                        "source_type": "lookahead",
+                        "barrier_role": "lookahead",
+                        "worker_capacity": worker_capacity,
+                        "prefetch_worker_target": prefetch_worker_target,
+                    },
                 )
             )
-            lookahead_active[task] = (admission_order, worker_idx)
-            note_launch(worker_idx)
+            active_after = note_launch(worker_idx)
+            lookahead_active[task] = {
+                "order": admission_order,
+                "worker_idx": worker_idx,
+                "sample_id": sample_id,
+                "source_type": "lookahead",
+                "barrier_role": "lookahead",
+                "launch_ts": time.time(),
+            }
+            emit_async_skd_event(
+                "lookahead_admit",
+                global_step=logical_step,
+                logical_step=logical_step,
+                sample_id=sample_id,
+                scheduler_worker_idx=worker_idx,
+                admission_order=admission_order,
+                source_type="lookahead",
+                barrier_role="lookahead",
+                worker_active_after=active_after,
+                worker_capacity=worker_capacity,
+                prefetch_worker_target=prefetch_worker_target,
+                lookahead_started_count=lookahead_started_count,
+                prefetch_limit=prefetch_limit,
+                reason="slot_available",
+            )
+            emit_async_skd_event(
+                "sample_launch",
+                global_step=logical_step,
+                logical_step=logical_step,
+                sample_id=sample_id,
+                scheduler_worker_idx=worker_idx,
+                order=admission_order,
+                source_type="lookahead",
+                barrier_role="lookahead",
+                worker_active_after=active_after,
+                worker_capacity=worker_capacity,
+                prefetch_worker_target=prefetch_worker_target,
+            )
             print(
                 "[ASYNC_SKD] prefetch_start "
                 f"sample_id={sample_id} admission_order={admission_order} "
                 f"worker={worker_idx} active_on_worker={worker_active_counts[worker_idx]} "
-                f"worker_capacity={worker_capacity}",
+                f"worker_capacity={worker_capacity} prefetch_worker_target={prefetch_worker_target}",
                 flush=True,
             )
 
@@ -301,16 +403,49 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     sample_id=partial_state.sample_id,
                     logical_step=partial_state.logical_step,
                     source_type=partial_state.source_type,
+                    async_skd_context={
+                        "global_step": logical_step,
+                        "logical_step": partial_state.logical_step,
+                        "sample_id": partial_state.sample_id,
+                        "scheduler_worker_idx": worker_idx,
+                        "order": admission_order,
+                        "source_type": partial_state.source_type,
+                        "barrier_role": "lookahead",
+                        "worker_capacity": worker_capacity,
+                        "prefetch_worker_target": prefetch_worker_target,
+                        "resumed_partial": True,
+                    },
                 )
             )
-            lookahead_active[task] = (admission_order, worker_idx)
-            note_launch(worker_idx)
+            active_after = note_launch(worker_idx)
+            lookahead_active[task] = {
+                "order": admission_order,
+                "worker_idx": worker_idx,
+                "sample_id": partial_state.sample_id,
+                "source_type": partial_state.source_type,
+                "barrier_role": "lookahead",
+                "launch_ts": time.time(),
+            }
+            emit_async_skd_event(
+                "sample_launch",
+                global_step=logical_step,
+                logical_step=partial_state.logical_step,
+                sample_id=partial_state.sample_id,
+                scheduler_worker_idx=worker_idx,
+                order=admission_order,
+                source_type=partial_state.source_type,
+                barrier_role="lookahead",
+                worker_active_after=active_after,
+                worker_capacity=worker_capacity,
+                prefetch_worker_target=prefetch_worker_target,
+                resumed_partial=True,
+            )
 
         def try_admit_lookahead(worker_idx: int) -> None:
             nonlocal lookahead_started_count
             if drain_requested or not current_active or lookahead_started_count >= prefetch_limit:
                 return
-            if worker_active_counts[worker_idx] >= worker_capacity:
+            if worker_active_counts[worker_idx] >= prefetch_worker_target:
                 return
             next_item = self._next_lookahead_sample(logical_step)
             if next_item is None:
@@ -331,16 +466,33 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
 
             for task in done:
                 if task in current_active:
-                    order, worker_idx = current_active.pop(task)
-                    note_finish(worker_idx)
+                    meta = current_active.pop(task)
+                    order = int(meta["order"])
+                    worker_idx = int(meta["worker_idx"])
+                    active_after = note_finish(worker_idx)
                     result = await task
                     if isinstance(result, AsyncSkdSample):
                         result.validate()
                         current_completed[order] = result.require_completed()
                     else:
                         current_completed[order] = result
-                    worker_completed_counts[worker_idx] += 1
+                    duration_ms = (time.time() - float(meta["launch_ts"])) * 1000
+                    emit_async_skd_event(
+                        "sample_finish",
+                        global_step=logical_step,
+                        logical_step=logical_step,
+                        sample_id=meta["sample_id"],
+                        scheduler_worker_idx=worker_idx,
+                        order=order,
+                        source_type=meta["source_type"],
+                        barrier_role="current",
+                        status="completed",
+                        duration_ms=duration_ms,
+                        worker_active_after=active_after,
+                        worker_capacity=worker_capacity,
+                    )
                     if not current_active and not drain_requested:
+                        actual_lt_sample_id = str(meta["sample_id"])
                         print(
                             "[ASYNC_SKD] drain_start "
                             f"completed_current={current_count} lookahead_active={len(lookahead_active)} "
@@ -348,18 +500,49 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                             f"carryover_next={len(carryover_partials)}",
                             flush=True,
                         )
+                        emit_async_skd_event(
+                            "drain_start",
+                            global_step=logical_step,
+                            logical_step=logical_step,
+                            actual_lt_sample_id=actual_lt_sample_id,
+                            actual_lt_worker_idx=worker_idx,
+                            actual_lt_duration_ms=duration_ms,
+                            current_completed=current_count,
+                            lookahead_active=len(lookahead_active),
+                            lookahead_started_count=lookahead_started_count,
+                            promoted_count=len(promoted_lookahead),
+                            carryover_next_count=len(carryover_partials),
+                        )
                         drain_requested = True
                     try_admit_lookahead(worker_idx)
 
             for task in done:
                 if task in lookahead_active:
-                    admission_order, worker_idx = lookahead_active.pop(task)
-                    note_finish(worker_idx)
+                    meta = lookahead_active.pop(task)
+                    admission_order = int(meta["order"])
+                    worker_idx = int(meta["worker_idx"])
+                    active_after = note_finish(worker_idx)
                     sample: AsyncSkdSample = await task
                     sample.validate()
+                    duration_ms = (time.time() - float(meta["launch_ts"])) * 1000
+                    emit_async_skd_event(
+                        "sample_finish",
+                        global_step=logical_step,
+                        logical_step=sample.logical_step,
+                        sample_id=sample.sample_id,
+                        scheduler_worker_idx=worker_idx,
+                        order=admission_order,
+                        source_type=sample.source_type,
+                        barrier_role="lookahead",
+                        status=sample.kind,
+                        duration_ms=duration_ms,
+                        committed_gen_chunks=sample.committed_gen_chunks,
+                        committed_prefix_tokens=sample.committed_prefix_tokens,
+                        worker_active_after=active_after,
+                        worker_capacity=worker_capacity,
+                    )
                     if sample.kind == "completed":
                         promoted_lookahead.append((admission_order, sample))
-                        worker_completed_counts[worker_idx] += 1
                         if not drain_requested:
                             try_admit_lookahead(worker_idx)
                         continue
@@ -383,31 +566,55 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                             f"worker={worker_idx}",
                             flush=True,
                         )
+                        emit_async_skd_event(
+                            "carryover_record",
+                            global_step=logical_step,
+                            logical_step=partial.logical_step,
+                            sample_id=partial.sample_id,
+                            scheduler_worker_idx=worker_idx,
+                            order=admission_order,
+                            source_type=partial.source_type,
+                            barrier_role="lookahead",
+                            reason=carryover_reason,
+                            committed_gen_chunks=partial.committed_gen_chunks,
+                            response_len=len(partial.response_mask),
+                            committed_prefix_tokens=partial.committed_prefix_tokens,
+                        )
                         carryover_partials.append((admission_order, partial))
 
-        self._async_skd_last_worker_slot_metrics = {
-            "async_skd/worker_capacity": worker_capacity,
-            "async_skd/worker_active_max": worker_active_max,
-            "async_skd/lookahead_started_count": lookahead_started_count,
-        }
-        for idx, count in enumerate(worker_completed_counts):
-            self._async_skd_last_worker_slot_metrics[f"async_skd/worker_{idx}_completed_count"] = count
+        lookahead_promoted_count = len(promoted_lookahead)
+        lookahead_carryover_count = len(carryover_partials)
+        lookahead_denominator = max(lookahead_started_count, 1)
         self._async_skd_last_step_metrics = {
-            "async_skd/lookahead_prefetch_limit": prefetch_limit,
             "async_skd/lookahead_started_count": lookahead_started_count,
-            "async_skd/lookahead_promoted_count": len(promoted_lookahead),
-            "async_skd/lookahead_carryover_count": len(carryover_partials),
+            "async_skd/lookahead_promoted_count": lookahead_promoted_count,
+            "async_skd/lookahead_carryover_count": lookahead_carryover_count,
             "async_skd/lookahead_continued_partial_count": lookahead_continued_partial_count,
-            "async_skd/worker_capacity": worker_capacity,
             "async_skd/worker_active_max": worker_active_max,
+            "async_skd/lookahead_promote_rate": lookahead_promoted_count / lookahead_denominator,
+            "async_skd/lookahead_carryover_rate": lookahead_carryover_count / lookahead_denominator,
         }
         print(
             "[ASYNC_SKD] rollout "
             f"prefetch_limit={prefetch_limit} started={lookahead_started_count} "
             f"promoted={len(promoted_lookahead)} carryover_next={len(carryover_partials)} "
             f"continued_partial={lookahead_continued_partial_count} "
-            f"worker_capacity={worker_capacity} worker_active_max={worker_active_max}",
+            f"worker_capacity={worker_capacity} prefetch_worker_target={prefetch_worker_target} "
+            f"worker_active_max={worker_active_max}",
             flush=True,
+        )
+        emit_async_skd_event(
+            "rollout_summary",
+            global_step=logical_step,
+            logical_step=logical_step,
+            prefetch_limit=prefetch_limit,
+            lookahead_started_count=lookahead_started_count,
+            lookahead_promoted_count=len(promoted_lookahead),
+            lookahead_carryover_count=len(carryover_partials),
+            lookahead_continued_partial_count=lookahead_continued_partial_count,
+            worker_capacity=worker_capacity,
+            prefetch_worker_target=prefetch_worker_target,
+            worker_active_max=worker_active_max,
         )
         self._async_skd_last_promoted_samples = [
             sample for _, sample in sorted(promoted_lookahead, key=lambda item: item[0])

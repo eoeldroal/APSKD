@@ -360,11 +360,12 @@ def test_record_async_skd_current_batch_metrics_reports_quota_and_row_counts():
         current_input_batch=current_input_batch,
     )
 
-    assert metrics["async_skd/current_base_batch_size"] == 2
     assert metrics["async_skd/current_carryover_count"] == 1
-    assert metrics["async_skd/current_fresh_quota"] == 1
     assert metrics["async_skd/current_fresh_count"] == 1
-    assert metrics["async_skd/current_input_batch_size"] == 2
+    assert metrics["async_skd/current_carryover_ratio"] == 0.5
+    assert "async_skd/current_base_batch_size" not in metrics
+    assert "async_skd/current_fresh_quota" not in metrics
+    assert "async_skd/current_input_batch_size" not in metrics
 
 
 def test_actor_update_batch_controls_use_single_dynamic_minibatch_for_lookahead():
@@ -425,12 +426,13 @@ def test_record_async_skd_post_generation_and_union_metrics():
     )
 
     assert metrics["async_skd/lookahead_promoted_count"] == 2
-    assert metrics["async_skd/gen_batch_output_size"] == 68
     assert metrics["async_skd/promoted_rows_appended"] == 4
     assert metrics["async_skd/promoted_rows_pending"] == 1
-    assert metrics["async_skd/train_batch_size_before_union"] == 68
-    assert metrics["async_skd/union_row_delta"] == 0
     assert metrics["async_skd/final_train_batch_size"] == 68
+    assert metrics["async_skd/promoted_append_ratio"] == 4 / 68
+    assert "async_skd/gen_batch_output_size" not in metrics
+    assert "async_skd/train_batch_size_before_union" not in metrics
+    assert "async_skd/union_row_delta" not in metrics
     remaining_inputs, remaining_outputs = source.pop_promoted_pairs(max_count=8)
     assert len(remaining_inputs) == 1
     assert len(remaining_outputs) == 1

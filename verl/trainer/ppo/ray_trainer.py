@@ -697,11 +697,9 @@ class RayPPOTrainer:
         fresh_quota = max(0, base_batch_size - carryover_count)
         metrics.update(
             {
-                "async_skd/current_base_batch_size": base_batch_size,
                 "async_skd/current_carryover_count": carryover_count,
-                "async_skd/current_fresh_quota": fresh_quota,
                 "async_skd/current_fresh_count": fresh_count,
-                "async_skd/current_input_batch_size": current_input_count,
+                "async_skd/current_carryover_ratio": carryover_count / max(base_batch_size, 1),
             }
         )
 
@@ -748,7 +746,6 @@ class RayPPOTrainer:
         promoted_rows_pending = promoted_available - promoted_rows_appended
         metrics.update(
             {
-                "async_skd/gen_batch_output_size": len(gen_batch_output),
                 "async_skd/promoted_rows_appended": promoted_rows_appended,
                 "async_skd/promoted_rows_pending": promoted_rows_pending,
             }
@@ -770,12 +767,11 @@ class RayPPOTrainer:
         gen_rows = len(gen_batch_output)
         final_rows = len(final_batch)
         row_delta = train_rows - gen_rows
+        promoted_rows_appended = int(metrics.get("async_skd/promoted_rows_appended", 0))
         metrics.update(
             {
-                "async_skd/train_batch_size_before_union": train_rows,
-                "async_skd/gen_batch_output_size": gen_rows,
-                "async_skd/union_row_delta": row_delta,
                 "async_skd/final_train_batch_size": final_rows,
+                "async_skd/promoted_append_ratio": promoted_rows_appended / max(final_rows, 1),
             }
         )
         print(

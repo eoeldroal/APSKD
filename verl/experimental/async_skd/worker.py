@@ -16,6 +16,7 @@ from verl.experimental.agent_loop.agent_loop import (
     get_trajectory_info,
     monkey_patch_timing_begin,
 )
+from verl.experimental.async_skd.events import async_skd_event_context
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.protocol import DataProto
 
@@ -74,7 +75,12 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
     def _strip_internal_async_skd_extra_fields(self, output: AgentLoopOutput) -> None:
         output.extra_fields.pop(_ASYNC_SKD_INPUT_NON_TENSOR_BATCH, None)
 
-    async def generate_sequence_single(self, batch: DataProto) -> DataProto:
+    async def generate_sequence_single(
+        self,
+        batch: DataProto,
+        *,
+        async_skd_context: dict[str, Any] | None = None,
+    ) -> DataProto:
         """Generate one sequence from agent loop without changing the batched API contract.
 
         This method is intentionally kept out of the base ``AgentLoopWorker``.
@@ -103,9 +109,10 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
 
         run_timer = monkey_patch_timing_begin(capture_gpu=True)
         kwargs = {k: v[0] for k, v in batch.non_tensor_batch.items()}
-        internal_output = await self._run_agent_loop(
-            sampling_params, trajectory_info[0], trace=trace_this_sample, **kwargs
-        )
+        with async_skd_event_context(**(async_skd_context or {})):
+            internal_output = await self._run_agent_loop(
+                sampling_params, trajectory_info[0], trace=trace_this_sample, **kwargs
+            )
         _monkey_patch_log_timing(
             "AsyncSkdAgentLoopWorker.generate_sequence_single.run",
             run_timer,
@@ -139,6 +146,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         logical_step: int,
         source_type: str,
         agent_name: str = "skd_agent",
+        async_skd_context: dict[str, Any] | None = None,
     ) -> AsyncSkdSample:
         """Run an SKD sample until completion or the next exportable boundary."""
         if (batch is None) == (partial_state is None):
@@ -168,14 +176,15 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
                 f"got {type(agent_loop).__name__} for agent_name={agent_name!r}"
             )
 
-        result = await agent_loop.run_until_exportable_boundary(
-            sampling_params,
-            sample_id=sample_id,
-            logical_step=logical_step,
-            source_type=source_type,
-            partial_state=partial_state,
-            **kwargs,
-        )
+        with async_skd_event_context(**(async_skd_context or {})):
+            result = await agent_loop.run_until_exportable_boundary(
+                sampling_params,
+                sample_id=sample_id,
+                logical_step=logical_step,
+                source_type=source_type,
+                partial_state=partial_state,
+                **kwargs,
+            )
 
         if isinstance(result, SkdPartialState):
             if batch is not None:
@@ -206,6 +215,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         *,
         source_type: str = "resumed_current",
         agent_name: str = "skd_agent",
+        async_skd_context: dict[str, Any] | None = None,
     ) -> AsyncSkdSample:
         """Resume an SKD partial as current-step work and run it to completion."""
         print(
@@ -226,10 +236,11 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
                 f"got {type(agent_loop).__name__} for agent_name={agent_name!r}"
             )
 
-        result = await agent_loop.run_from_partial_to_completion(
-            sampling_params,
-            partial_state=partial_state,
-        )
+        with async_skd_event_context(**(async_skd_context or {})):
+            result = await agent_loop.run_from_partial_to_completion(
+                sampling_params,
+                partial_state=partial_state,
+            )
         self._strip_internal_async_skd_extra_fields(result)
         postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
         internal_output = await self._agent_loop_postprocess(result, False, **postprocess_kwargs)

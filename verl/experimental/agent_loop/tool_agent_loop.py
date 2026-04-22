@@ -305,12 +305,12 @@ class ToolAgentLoop(AgentLoopBase):
                         "data. Plase use a vlm as the base model."
                     )
                 content = []
+                if tool_response.text:
+                    content.append({"type": "text", "text": tool_response.text})
                 if tool_response.image:
                     content.append({"type": "image"})
                 if tool_response.video:
                     content.append({"type": "video"})
-                if tool_response.text:
-                    content.append({"type": "text", "text": tool_response.text})
                 message = {"role": "tool", "content": content}
             else:
                 # Text-only content

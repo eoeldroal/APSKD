@@ -12,6 +12,15 @@
 - Staleness continuation은 committed SKD generation chunk 수로 제한한다.
 - 구현을 함수 단위로 작게 나눠, 각 단계마다 확인 가능한 상태로 닫는다.
 
+현재 코드 기준 상태:
+
+- `AsyncSkdAgentLoopManager`, `AsyncSkdAgentLoopWorker`, `AsyncSkdDataSource`는 구현되어 있다.
+- lookahead admission은 `actor_rollout_ref.rollout.agent.async_skd_prefetch_limit`와 `async_skd_prefetch_worker_target`로 제어한다.
+- promoted input/output row accounting은 `record_promoted()`와 `pop_promoted_pairs()`로 처리한다.
+- carryover current work와 fresh current work는 같은 `_generate_current_work_with_lookahead()` loop를 사용한다.
+- 별도 `async_skd_max_old_gen_chunks` cap은 현재 구현되어 있지 않다. generation cap은 SKD 본체의 `distillation.skd.max_chunks_per_sample`가 담당한다.
+- event log와 dashboard는 구현되어 있다. W&B에는 compact step summary만 남긴다.
+
 비목표는 다음이다.
 
 - 처음부터 trainer loop 전체를 갈아엎는 별도 fully async trainer를 만들지 않는다.
@@ -48,10 +57,10 @@ teacher row = dummy zero row
 ### 1.2 Staleness
 
 ```text
-committed_gen_chunks < async_skd_max_old_gen_chunks
+current code: no async_skd_max_old_gen_chunks gate
 ```
 
-MVP 기본값은 `async_skd_max_old_gen_chunks = 16`이다.
+초기 계획에는 `async_skd_max_old_gen_chunks`가 있었지만 현재 코드의 source of truth는 아니다. 현재 lookahead는 current work가 남아 있는 동안 exportable boundary 단위로 계속 재개될 수 있고, current work가 모두 끝나면 drain/carryover로 넘어간다. per-sample hard stop은 `distillation.skd.max_chunks_per_sample`이다.
 
 ### 1.3 Lookahead Admission
 
@@ -569,7 +578,7 @@ def _can_export_partial_state(self, agent_data: AgentData, next_state: AgentStat
 추가 rule:
 
 - EOS 없는 open tool-call prefix는 export 가능하다.
-- EOS 없는 closed `</tool_call>` block은 export 금지다.
+- EOS 없는 closed `</tool_call>` block도 export 가능하다. 이 상태에서는 parser를 실행하지 않고 assistant generation prefix로만 저장한다.
 - EOS 있는 valid tool call은 `PROCESSING_TOOLS`로 진행하고, tool result append 후 export한다.
 - EOS 있는 no-tool assistant turn은 interaction 또는 termination으로 진행한다.
 
@@ -1108,7 +1117,7 @@ Dynamic batch size `B + promoted_count`가 생기는 시점에는 reward/advanta
 
 ### 12.1 Promoted Dynamic Batch Assembly
 
-This is the next required implementation step before adding more lookahead concurrency.
+Status: implemented.
 
 Problem:
 
@@ -1120,33 +1129,32 @@ DataProto.union() requires equal row count
 
 Therefore promoted output cannot be returned without the matching promoted input rows.
 
-Required source API:
+Implemented source API:
 
 ```python
 class AsyncSkdDataSource:
     def record_promoted(self, samples: list[AsyncSkdSample]) -> None:
         ...
 
-    def pop_promoted_input_batches(self) -> list[DataProto]:
+    def pop_promoted_pairs(self, max_count: int | None = None) -> tuple[list[DataProto], list[DataProto]]:
         ...
 ```
 
-Required manager behavior:
+Implemented manager behavior:
 
 ```text
 completed lookahead -> keep AsyncSkdSample envelope
 source.record_promoted(promoted_samples)
-manager returns base outputs + promoted outputs
+manager returns current outputs
+source keeps promoted input/output pairs for trainer append
 ```
 
-Required trainer behavior:
+Implemented trainer behavior:
 
 ```text
-base_input_batch = batch from _iter_training_batches()
-promoted_input_batch = source.pop_promoted_input_batches()
-if promoted_input_batch:
-    batch = DataProto.concat([base_input_batch, promoted_input_batch])
-batch = batch.repeat(...)
+promoted_inputs, promoted_outputs = source.pop_promoted_pairs(max_count=appendable_count)
+batch = DataProto.concat([current_input_batch] + promoted_inputs)
+gen_batch_output = DataProto.concat([current_gen_output] + promoted_outputs)
 batch = batch.union(gen_batch_output)
 ```
 
@@ -1157,14 +1165,14 @@ input rows:  base inputs, promoted inputs
 output rows: base outputs, promoted outputs
 ```
 
-The source must preserve promoted input order using the same admission order used by manager output ordering.
+The source preserves promoted input/output pair order using admission order. Trainer appends only a DP-divisible number of promoted rows; remaining pairs stay pending.
 
 Tests:
 
 ```text
 tests/skd/test_async_skd_data_source.py
   - record_promoted stores promoted input rows in output order
-  - pop_promoted_input_batches returns and clears rows
+  - pop_promoted_pairs returns and clears matched input/output rows
 
 tests/trainer/ppo/test_ray_trainer_async_skd_helpers_on_cpu.py
   - trainer assembles B + Delta input rows before union
@@ -1190,17 +1198,19 @@ Use existing hook:
 _can_continue_lookahead_partial(partial_state)
 ```
 
-Do not create a new scheduler class for this. The required fields already live in `SkdPartialState`:
+Historical note: this section is not implemented in the current code. Do not create a new scheduler class for this without re-opening the design. The relevant field already lives in `SkdPartialState`:
 
 ```text
 committed_gen_chunks
 ```
 
-The predicate must enforce:
+The previous plan proposed:
 
 ```text
 committed_gen_chunks < async_skd_max_old_gen_chunks
 ```
+
+Current code does not enforce this predicate.
 
 ### 13.2 Lookahead Admission During Carry-Over Current Work
 
@@ -1408,32 +1418,24 @@ verl/workers/config/distillation.py
 verl/trainer/config/distillation/distillation.yaml
 ```
 
-### 15.1 Add Config Dataclass
+### 15.1 Config Location
 
-```python
-@dataclass
-class AsyncSkdLookaheadConfig(BaseConfig):
-    enable: bool = False
-    persistent_rollout_engines: bool = True
-    prefetch_admission_ratio: float = 0.25
-    prefetch_pair_quota: bool = True
-    max_old_gen_chunks: int = 16
-    promote_finished: bool = True
-    tool_macro_step_atomic: bool = True
-    source_aware_metrics: bool = True
+Current code uses rollout-agent config fields rather than an `AsyncSkdLookaheadConfig` under `DistillationConfig`.
+
+```text
+actor_rollout_ref.rollout.agent.agent_loop_manager_class
+actor_rollout_ref.rollout.agent.async_skd_mode
+actor_rollout_ref.rollout.agent.async_skd_prefetch_limit
+actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target
 ```
 
-Then attach to:
+The SKD generation limits remain under distillation:
 
-```python
-class DistillationConfig:
-    async_skd_lookahead: AsyncSkdLookaheadConfig
+```text
+distillation.skd.chunk_size
+distillation.skd.verify_top_k
+distillation.skd.max_chunks_per_sample
 ```
-
-왜 distillation config인가:
-
-- 이 기능은 일반 PPO async가 아니라 SKD semantics에 묶여 있다.
-- Teacher row alignment, SKD chunk, top-k teacher target과 직접 연결된다.
 
 ## 16. Phase 13: Persistent Rollout Weight Sync
 
@@ -1660,6 +1662,8 @@ Expected behavior:
 
 ### Patch 10: Stale Budget Enforcement
 
+Status: not implemented in current code.
+
 Files:
 
 ```text
@@ -1669,14 +1673,13 @@ tests/skd/test_async_skd_manager_lookahead.py
 
 Changes:
 
-- implement `_can_continue_lookahead_partial()`.
-- read `async_skd_max_old_gen_chunks`.
-- carry over partials that reach the chunk budget instead of continuing speculative rollout.
+- historical plan: implement `_can_continue_lookahead_partial()`.
+- historical plan: read `async_skd_max_old_gen_chunks`.
+- current behavior: no separate stale-prefix hard cap; drain/carryover is controlled by current-work barrier and SKD `max_chunks_per_sample`.
 
 Expected behavior:
 
-- lookahead partials do not keep advancing indefinitely while base LT is still running.
-- stale prefix size is bounded before resume.
+- not guaranteed by a separate stale cap in current code.
 
 ### Patch 11: Lookahead Admission During Carry-Over Current Work
 
@@ -1800,6 +1803,8 @@ Expected behavior:
 
 ### Patch 16: Config Schema
 
+Status: implemented differently from the original plan.
+
 Files:
 
 ```text
@@ -1810,14 +1815,14 @@ examples/on_policy_distillation_trainer/run_*skd*.sh
 
 Changes:
 
-- add async SKD lookahead config fields.
-- keep ad hoc config keys as backward-compatible aliases only if needed.
-- validate `rollout.n == 1`, REMAX disabled, rollout skip disabled, and curriculum sampler disabled.
+- async mode and lookahead admission fields live under `actor_rollout_ref.rollout.agent`.
+- no `async_skd_lookahead` dataclass exists under `DistillationConfig`.
+- `rollout.n == 1` is validated by `AsyncSkdAgentLoopManager`.
 
 Expected behavior:
 
 - experiment scripts can enable lookahead through explicit config fields.
-- stale budget values are no longer hard-coded in manager methods.
+- stale budget values are not part of current config.
 
 ### Patch 17: Persistent Weight Sync
 
@@ -1909,7 +1914,7 @@ teacher_logprobs
 ### Gate C: Staleness
 
 ```text
-max(committed_gen_chunks for continued lookahead partials) < async_skd_max_old_gen_chunks
+current code has no async_skd_max_old_gen_chunks gate
 ```
 
 ### Gate D: Lookahead Accounting
@@ -1918,7 +1923,7 @@ max(committed_gen_chunks for continued lookahead partials) < async_skd_max_old_g
 started_lookahead <= L_prefetch
 next_fresh_quota = B - carryover_count
 promoted_count affects source duplicate prevention only
-no k+2 sample admitted
+lookahead reservation is bounded by source ledger and prefetch limit
 ```
 
 ### Gate E: Tool Atomicity
@@ -1948,8 +1953,8 @@ source_type별 tool call count
 첫 구현은 conservative하게 잡는다.
 
 ```text
-prefetch_admission_ratio = 0.25
-max_old_gen_chunks = 16
+async_skd_prefetch_limit = 64
+async_skd_prefetch_worker_target = 20
 promote_finished = true
 tool_macro_step_atomic = true
 ```

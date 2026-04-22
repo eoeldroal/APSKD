@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import numpy as np
@@ -40,7 +41,13 @@ class _FakeLookaheadWorker:
         self.generate_skd_until_boundary = _RemoteMethod(self._generate_skd_until_boundary)
         self.generate_skd_from_partial_to_completion = _RemoteMethod(self._generate_skd_from_partial_to_completion)
 
-    async def _generate_sequence_single(self, sample: DataProto) -> DataProto:
+    async def _generate_sequence_single(
+        self,
+        sample: DataProto,
+        *,
+        async_skd_context: dict[str, Any] | None = None,
+    ) -> DataProto:
+        del async_skd_context
         input_pos = int(sample.non_tensor_batch["input_pos"][0])
         self._calls.append((self._name, "base", input_pos))
         await asyncio.sleep(self._base_delays.get(input_pos, 0.0))
@@ -56,7 +63,9 @@ class _FakeLookaheadWorker:
         sample_id: str,
         logical_step: int,
         source_type: str,
+        async_skd_context: dict[str, Any] | None = None,
     ) -> AsyncSkdSample:
+        del async_skd_context
         del logical_step, source_type
         if batch is not None:
             input_pos = int(batch.non_tensor_batch["input_pos"][0])
@@ -70,7 +79,13 @@ class _FakeLookaheadWorker:
             sample.require_completed().meta_info["metrics"][0]["rollout_server_id"] = self._name
         return sample
 
-    async def _generate_skd_from_partial_to_completion(self, partial_state: SkdPartialState) -> AsyncSkdSample:
+    async def _generate_skd_from_partial_to_completion(
+        self,
+        partial_state: SkdPartialState,
+        *,
+        async_skd_context: dict[str, Any] | None = None,
+    ) -> AsyncSkdSample:
+        del async_skd_context
         self._calls.append((self._name, "carryover", partial_state.sample_id))
         await asyncio.sleep(0)
         sample = self._lookahead_results[partial_state.sample_id].pop(0)
@@ -215,6 +230,7 @@ def _make_manager(
     lookahead_results: dict[str, list[AsyncSkdSample]],
     base_delays: dict[int, float] | None = None,
     rollout_n: int = 1,
+    prefetch_worker_target: int | None = None,
 ):
     calls: list[tuple[str, str, Any]] = []
     manager = AsyncSkdAgentLoopManager.__new__(AsyncSkdAgentLoopManager)
@@ -226,6 +242,11 @@ def _make_manager(
                     "agent": {
                         "async_skd_mode": "lookahead",
                         "async_skd_prefetch_limit": prefetch_limit,
+                        **(
+                            {"async_skd_prefetch_worker_target": prefetch_worker_target}
+                            if prefetch_worker_target is not None
+                            else {}
+                        ),
                     },
                 }
             }
@@ -337,7 +358,7 @@ async def test_carryover_path_records_promoted_for_trainer_append():
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100", "lookahead-101"]
     assert source.carryover_partials == []
     assert [call[1] for call in calls].count("lookahead") == 2
-    assert output.meta_info["timing"]["async_skd/lookahead_started_count"] == 2
+    assert output.meta_info["async_skd_metrics"]["async_skd/lookahead_started_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -576,15 +597,54 @@ async def test_lookahead_refill_does_not_exceed_worker_capacity():
 
     timing = output.meta_info["timing"]
     metrics = output.meta_info["async_skd_metrics"]
-    assert timing["async_skd/worker_capacity"] == 2
-    assert timing["async_skd/worker_active_max"] <= 2
-    assert timing["async_skd/lookahead_started_count"] == 4
-    assert metrics["async_skd/lookahead_prefetch_limit"] == 4
+    assert not any(key.startswith("async_skd/") for key in timing)
     assert metrics["async_skd/lookahead_started_count"] == 4
     assert metrics["async_skd/lookahead_promoted_count"] == 4
     assert metrics["async_skd/lookahead_carryover_count"] == 0
     assert metrics["async_skd/worker_active_max"] <= 2
+    assert metrics["async_skd/lookahead_promote_rate"] == 1.0
+    assert metrics["async_skd/lookahead_carryover_rate"] == 0.0
     assert [call[1] for call in calls].count("lookahead") == 4
+
+
+@pytest.mark.asyncio
+async def test_lookahead_refill_respects_prefetch_worker_target_below_current_capacity(tmp_path, monkeypatch):
+    event_path = tmp_path / "async_skd_events.jsonl"
+    monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    manager, calls, _ = _make_manager(
+        prefetch_limit=4,
+        prefetch_worker_target=1,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+        base_delays={2: 0.05, 3: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+
+    timing = output.meta_info["timing"]
+    metrics = output.meta_info["async_skd_metrics"]
+    assert not any(key.startswith("async_skd/") for key in timing)
+    assert metrics["async_skd/lookahead_started_count"] == 4
+    assert metrics["async_skd/worker_active_max"] <= 2
+    assert [call[1] for call in calls].count("lookahead") == 4
+
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    lookahead_launches = [
+        event for event in events if event["event"] == "sample_launch" and event.get("source_type") == "lookahead"
+    ]
+    assert len(lookahead_launches) == 4
+    assert all(event["prefetch_worker_target"] == 1 for event in lookahead_launches)
+    assert all(event["worker_active_after"] <= 1 for event in lookahead_launches)
 
 
 @pytest.mark.asyncio
@@ -617,7 +677,7 @@ async def test_lookahead_refill_stops_after_base_barrier_drain():
 
 
 @pytest.mark.asyncio
-async def test_lookahead_reports_worker_slot_and_server_distribution_metrics():
+async def test_lookahead_reports_compact_wandb_metrics_without_timing_namespace():
     manager, _, _ = _make_manager(
         prefetch_limit=2,
         source_items=[
@@ -634,12 +694,12 @@ async def test_lookahead_reports_worker_slot_and_server_distribution_metrics():
     timing = output.meta_info["timing"]
     metrics = output.meta_info["async_skd_metrics"]
 
-    assert timing["async_skd/worker_capacity"] == 2
-    assert timing["async_skd/lookahead_started_count"] == 2
-    assert "async_skd/worker_0_completed_count" in timing
-    assert "async_skd/worker_1_completed_count" in timing
+    assert not any(key.startswith("async_skd/") for key in timing)
+    assert metrics["async_skd/lookahead_started_count"] == 2
     assert metrics["async_skd/lookahead_promoted_count"] == 2
     assert metrics["async_skd/lookahead_carryover_count"] == 0
+    assert metrics["async_skd/lookahead_promote_rate"] == 1.0
+    assert metrics["async_skd/lookahead_carryover_rate"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -653,3 +713,39 @@ async def test_lookahead_manager_rejects_rollout_n_greater_than_one():
 
     with pytest.raises(ValueError, match="rollout.n == 1"):
         await manager.generate_sequences(_make_prompts(1))
+
+
+@pytest.mark.asyncio
+async def test_lookahead_manager_emits_realtime_scheduler_events(tmp_path, monkeypatch):
+    event_path = tmp_path / "async_skd_events.jsonl"
+    monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    manager, _, _ = _make_manager(
+        prefetch_limit=1,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={"lookahead-100": [_make_completed_sample("lookahead-100", 100)]},
+        base_delays={1: 0.02},
+    )
+
+    await manager.generate_sequences(_make_prompts(2))
+
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    current_launches = [
+        event
+        for event in events
+        if event["event"] == "sample_launch" and event["barrier_role"] == "current"
+    ]
+    lookahead_launches = [
+        event
+        for event in events
+        if event["event"] == "sample_launch" and event["barrier_role"] == "lookahead"
+    ]
+    assert len(current_launches) == 2
+    assert current_launches[0]["source_type"] == "base_current"
+    assert current_launches[0]["scheduler_worker_idx"] == 0
+    assert current_launches[0]["worker_capacity"] == 1
+    assert [event["sample_id"] for event in lookahead_launches] == ["lookahead-100"]
+    assert any(event["event"] == "sample_finish" and event["barrier_role"] == "current" for event in events)
+    drain_events = [event for event in events if event["event"] == "drain_start"]
+    assert len(drain_events) == 1
+    assert drain_events[0]["actual_lt_sample_id"]
+    assert drain_events[0]["current_completed"] == 2

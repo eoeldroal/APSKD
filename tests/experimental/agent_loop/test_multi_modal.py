@@ -14,6 +14,7 @@
 import json
 import os
 from typing import Any
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ from PIL import Image
 from transformers.utils import get_json_schema
 
 from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
+from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.protocol import DataProto
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema
 from verl.tools.schemas import ToolResponse
@@ -121,6 +123,65 @@ class ImageGeneratorTool(BaseTool):
             return ToolResponse(image=[image]), 0, {}
         except Exception as e:
             return ToolResponse(text=str(e)), 0, {}
+
+
+@pytest.mark.asyncio
+async def test_tool_result_message_orders_text_before_single_image(monkeypatch):
+    image = Image.new("RGB", (1, 1), (255, 0, 0))
+    captured = {}
+
+    async def fake_call_tool(self, tool_call, tools_kwargs, agent_data):
+        del self, tool_call, tools_kwargs, agent_data
+        return ToolResponse(text="Rendered chart.", image=[image]), 0.0, {}
+
+    async def fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, **kwargs):
+        del videos, kwargs
+        captured["messages"] = messages
+        captured["images"] = images
+        captured["remove_system_prompt"] = remove_system_prompt
+        return [101, 102]
+
+    monkeypatch.setattr(ToolAgentLoop, "_call_tool", fake_call_tool)
+
+    loop = ToolAgentLoop.__new__(ToolAgentLoop)
+    loop.max_parallel_calls = 1
+    loop.processor = SimpleNamespace(image_processor=object())
+    loop.tool_parser_name = "hermes"
+    loop.loop = None
+    loop.apply_chat_template = fake_apply_chat_template
+    loop.response_length = 32
+    loop.max_tool_response_length = 1024
+    loop.tool_response_truncate_side = "right"
+
+    agent_data = AgentData(
+        messages=[{"role": "user", "content": "plot"}],
+        image_data=None,
+        video_data=None,
+        metrics={},
+        request_id="req-tool-image",
+        tools_kwargs={},
+    )
+    agent_data.prompt_ids = [1, 2, 3]
+    agent_data.response_mask = [1]
+    agent_data.tool_calls = [SimpleNamespace(name="render_chart", arguments='{"spec":"plot"}')]
+
+    next_state = await ToolAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+    assert next_state == AgentState.GENERATING
+    assert captured["remove_system_prompt"] is True
+    assert captured["images"] == [image]
+    assert captured["messages"] == [
+        {
+            "role": "tool",
+            "content": [
+                {"type": "text", "text": "Rendered chart."},
+                {"type": "image"},
+            ],
+        }
+    ]
+    assert agent_data.image_data == [image]
+    assert agent_data.prompt_ids == [1, 2, 3, 101, 102]
+    assert agent_data.response_mask == [1, 0, 0]
 
 
 @pytest.mark.flaky(reruns=3)

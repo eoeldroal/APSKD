@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+from verl.experimental.async_skd.events import get_async_skd_event_context
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
@@ -128,6 +129,7 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
                     "source_type": source_type,
                     "partial_state": partial_state,
                     "kwargs": kwargs,
+                    "event_context": get_async_skd_event_context(),
                 }
             )
             return loop_result
@@ -145,6 +147,7 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
                     "sampling_params": sampling_params,
                     "partial_state": partial_state,
                     "completion": True,
+                    "event_context": get_async_skd_event_context(),
                 }
             )
             return loop_result
@@ -177,6 +180,32 @@ async def test_generate_skd_until_boundary_wraps_partial_result_from_fresh_batch
     assert worker.loop.calls[0]["source_type"] == "lookahead"
     assert worker.loop.calls[0]["partial_state"] is None
     assert worker.loop.calls[0]["kwargs"]["raw_prompt"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_generate_skd_until_boundary_sets_async_skd_event_context():
+    partial = make_partial()
+    worker = _DummyWorker(partial)
+
+    await worker.generate_skd_until_boundary(
+        make_single_batch(),
+        sample_id="fresh-sample",
+        logical_step=12,
+        source_type="lookahead",
+        async_skd_context={
+            "sample_id": "fresh-sample",
+            "scheduler_worker_idx": 3,
+            "source_type": "lookahead",
+            "barrier_role": "lookahead",
+        },
+    )
+
+    assert worker.loop.calls[0]["event_context"] == {
+        "sample_id": "fresh-sample",
+        "scheduler_worker_idx": 3,
+        "source_type": "lookahead",
+        "barrier_role": "lookahead",
+    }
 
 
 @pytest.mark.asyncio

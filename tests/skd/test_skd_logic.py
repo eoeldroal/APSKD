@@ -10,6 +10,7 @@ quickly on CPU.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ import torch
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.async_skd.events import async_skd_event_context
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.workers.rollout.replica import TokenOutput
 
@@ -111,6 +113,7 @@ class FakeTeacherServer:
         self.k = k
         self.call_count = 0
         self.call_log: list[dict[str, Any]] = []
+        self.released_request_ids: list[str] = []
 
     async def compute_teacher_logprobs_single(
         self,
@@ -120,7 +123,6 @@ class FakeTeacherServer:
         logprob_start_len: int = 0,
         multi_modal_data: dict[str, Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del multi_modal_data
         prefix_len = logprob_start_len + 1 if logprob_start_len > 0 else 0
         chunk = list(sequence_ids[prefix_len:])
         overrides = self.topk_by_call[self.call_count] if self.call_count < len(self.topk_by_call) else {}
@@ -140,10 +142,14 @@ class FakeTeacherServer:
                 "prefix_len": prefix_len,
                 "chunk": chunk,
                 "rows": rows,
+                "multi_modal_data": multi_modal_data,
             }
         )
         self.call_count += 1
         return torch.tensor(rows, dtype=torch.int32), torch.tensor(logprobs, dtype=torch.float32)
+
+    async def release_sticky_session(self, request_id: str) -> None:
+        self.released_request_ids.append(request_id)
 
 
 class FakeToolParser:
@@ -429,6 +435,35 @@ async def test_rejection_at_first_token_discards_suffix():
 
 
 @pytest.mark.asyncio
+async def test_skd_chunk_commit_emits_realtime_progress_event(tmp_path, monkeypatch):
+    event_path = tmp_path / "async_skd_events.jsonl"
+    monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    loop = make_skd_loop(
+        student_chunks=[[777, 20, 30]],
+        teacher_topk_by_call=[{0: [100, 101, 102]}],
+        max_chunks=1,
+    )
+    agent_data = make_agent_data([1, 2, 3])
+
+    with async_skd_event_context(
+        sample_id="sample-reject",
+        scheduler_worker_idx=0,
+        source_type="base_current",
+        barrier_role="current",
+    ):
+        await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    [chunk_event] = [event for event in events if event["event"] == "chunk_commit"]
+    assert chunk_event["sample_id"] == "sample-reject"
+    assert chunk_event["chunk_idx"] == 1
+    assert chunk_event["accepted"] == 0
+    assert chunk_event["rejected"] == 1
+    assert chunk_event["new_tokens"] == 1
+    assert chunk_event["response_len"] == 1
+
+
+@pytest.mark.asyncio
 async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume():
     loop = make_skd_loop(
         student_chunks=[
@@ -522,7 +557,11 @@ async def test_skd_export_allows_open_tool_call_prefix_without_eos():
 
 
 @pytest.mark.asyncio
-async def test_skd_export_rejects_closed_tool_call_without_eos():
+async def test_skd_export_allows_closed_tool_call_without_eos_as_generation_prefix():
+    class _ParserMustNotRun:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            raise AssertionError("tool parser must not run before EOS")
+
     loop = make_skd_loop(
         student_chunks=[
             [OPEN_TOOL, 11, CLOSE_TOOL],
@@ -532,6 +571,7 @@ async def test_skd_export_rejects_closed_tool_call_without_eos():
         ],
     )
     loop.tokenizer = FakeHermesTokenizer()
+    loop.tool_parser = _ParserMustNotRun()
     agent_data = make_agent_data([1, 2, 3])
 
     next_state = await SkdAgentLoop._handle_generating_state(
@@ -543,7 +583,17 @@ async def test_skd_export_rejects_closed_tool_call_without_eos():
     )
 
     assert next_state == AgentState.GENERATING
-    assert not loop._can_export_partial_state(agent_data, next_state)
+    assert loop._can_export_partial_state(agent_data, next_state)
+    partial = loop._export_partial_state(
+        agent_data,
+        next_state,
+        sample_id="sample-closed-tool-no-eos",
+        logical_step=10,
+        source_type="lookahead",
+    )
+    assert partial.agent_state == AgentState.GENERATING.value
+    assert partial.response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]
+    assert partial.response_mask == [1, 1, 1]
     assert_skd_alignment(agent_data)
 
 
@@ -674,6 +724,7 @@ async def test_skd_run_until_exportable_boundary_fresh_returns_partial():
     assert result.extra_fields["raw_prompt"] == [{"role": "user", "content": "question"}]
     assert result.extra_fields["teacher_ids_list"] == [[10, 0, 0, 0], [11, 0, 0, 0]]
     assert result.extra_fields["teacher_logprobs_list"] == [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K]
+    assert loop.teacher_server_manager.released_request_ids == [result.request_id]
 
 
 @pytest.mark.asyncio
@@ -745,6 +796,7 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
         [20, 0, 0, 0],
         [EOS, 0, 0, 0],
     ]
+    assert result.extra_fields["parent_request_id"] is None
 
 
 @pytest.mark.asyncio
@@ -797,6 +849,7 @@ async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediat
         ],
     )
 
+    old_request_id = partial.request_id
     result = await loop.run_from_partial_to_completion({}, partial_state=partial)
 
     assert isinstance(result, AgentLoopOutput)
@@ -806,6 +859,14 @@ async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediat
     assert loop.server_manager.call_count == 2
     assert result.extra_fields["skd_termination_reason"] == "eos"
     assert "skd_pending_turn_response_ids" not in result.extra_fields
+    new_student_request_ids = {entry["request_id"] for entry in loop.server_manager.call_log}
+    new_teacher_request_ids = {entry["request_id"] for entry in loop.teacher_server_manager.call_log}
+    assert len(new_student_request_ids) == 1
+    assert new_student_request_ids == new_teacher_request_ids
+    [new_request_id] = list(new_teacher_request_ids)
+    assert new_request_id != old_request_id
+    assert result.extra_fields["parent_request_id"] == old_request_id
+    assert loop.teacher_server_manager.released_request_ids == [new_request_id]
 
 
 @pytest.mark.asyncio
@@ -828,6 +889,19 @@ async def test_skd_generating_state_handles_budget_exhausted_before_first_chunk(
     assert agent_data.assistant_turns == 0
     assert agent_data.extra_fields["skd_termination_reason"] == "budget_exhausted"
     assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_verification_receives_current_tool_images():
+    image = object()
+    loop = make_skd_loop(student_chunks=[[10, EOS]])
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = [image]
+
+    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    assert next_state == AgentState.TERMINATED
+    assert loop.teacher_server_manager.call_log[0]["multi_modal_data"] == {"images": [image]}
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,7 @@
 - 학습 시에는 항상 trainer의 현재 student forward로 KD loss를 계산한다.
 - 따라서 stale rollout logit을 쓰는 문제는 없다.
 - 하지만 stale policy가 방문한 context/trajectory distribution shift는 남는다.
-- 이 residual shift는 version lag, lookahead budget, old-prefix cap, tool macro-step atomicity로 제한하고 로그로 계측한다.
+- 이 residual shift는 현재 코드에서 주로 lookahead budget, worker admission target, tool macro-step atomicity로 제한하고 로그로 계측한다. 별도 old-prefix cap은 구현되어 있지 않다.
 
 Tool 사용 시에는 용어를 분리해야 한다. `skd_chunk_size`로 자르는 SKD chunk는 student가 생성한 assistant token에만 적용된다. Tool result는 student chunk 안에 있지 않다. 다만 scheduler와 staleness accounting 관점에서는 assistant tool-call 생성부터 tool result append와 dummy teacher row 정렬까지를 하나의 **tool macro-step**으로 취급한다.
 
@@ -113,7 +113,8 @@ EOS 없음 + open tool-call prefix:
   export 가능, tool 실행 금지
 
 EOS 없음 + closed </tool_call> block:
-  export 금지, 다음 chunk에서 EOS까지 진행
+  export 가능, tool 실행 금지
+  EOS가 없으므로 assistant turn은 아직 닫히지 않은 generation prefix로 본다.
 
 EOS 있음 + valid tool call:
   PROCESSING_TOOLS로 진행하고 tool result append 후 export 가능
@@ -254,17 +255,17 @@ L_prefetch = min(32, 32) = 32
 
 ### 3.2 Stale Generation Chunk Cap
 
-Paused carry-over sample 하나가 old version으로 진행할 수 있는 committed SKD generation chunk 수의 상한이다.
+Historical design note. Paused carry-over sample 하나가 old version으로 진행할 수 있는 committed SKD generation chunk 수를 별도 cap으로 제한하자는 초기 안이었다. 현재 코드는 이 cap을 구현하지 않는다.
 
-권장값:
+초기 권장값:
 
 ```text
 max_old_gen_chunks = 16
 ```
 
-이 값은 stale continuation을 제어하는 유일한 MVP cap이다. SKD chunk size가 256이면 16 chunks는 약 4096 generated tokens다. `max_length=8192` 기준으로 절반, `max_length=12288` 기준으로 1/3 수준이다.
+현재 구현에서 per-sample generation hard stop은 `distillation.skd.max_chunks_per_sample`이다. Lookahead partial은 current work가 남아 있는 동안 exportable boundary 단위로 재개될 수 있고, current work가 모두 끝나면 drain/carryover로 넘어간다.
 
-`committed_env_units`, `committed_prefix_tokens`, `version_lag`, `version_span`은 MVP continuation gate에서 제외한다. Chunk가 scheduler의 최소 continuation 단위이므로 token/env/version cap을 동시에 넣지 않는다.
+`committed_env_units`, `committed_prefix_tokens`, `version_lag`, `version_span`은 현재 continuation gate로 쓰지 않는다.
 
 ## 4. Mathematical Formulation
 
@@ -624,7 +625,7 @@ open tool-call prefix:
 
 closed </tool_call> block without EOS:
   Hermes parser가 parse 가능한 block을 볼 수 있어도 Qwen/Hermes assistant turn은 닫히지 않았다.
-  export하지 말고 generation을 더 진행한다.
+  tool execution 대상이 아니라 assistant prefix로 carry-over 가능하다.
 
 EOS + valid tool call:
   tool execution으로 진행한다.
@@ -1087,38 +1088,39 @@ Reasons:
 
 Reuse map:
 
-| Remaining work | Reuse mechanism | Do not use |
+| Current component | Reuse mechanism | Do not use |
 |---|---|---|
 | Promoted dynamic batch assembly | `DataProto.concat`, `DataProto.union`, `AsyncSkdDataSource` reservation ledger | new trainer subclass |
 | Carry-over current work scheduling | existing `AsyncSkdAgentLoopManager` task loop | `FullyAsyncRollouter` queue |
-| Stale budget enforcement | `_can_continue_lookahead_partial()` hook | new scheduler class |
 | Checkpoint integration | `RayPPOTrainer._save_checkpoint()` and `_load_checkpoint()` hooks | separate checkpoint engine |
-| Source-aware metrics | `DataProto.meta_info`, existing trainer metrics dict | `FullyAsync` metric names copied verbatim |
-| Persistent rollout weight sync | GKD `sync_rollout_weights()` as reference | GKD trainer inheritance |
+| Source-aware metrics | `DataProto.meta_info`, existing trainer metrics dict, async SKD event log | `FullyAsync` metric names copied verbatim |
+| Rollout weight sync | existing actor/rollout checkpoint manager path | GKD trainer inheritance |
 
-The next implementation priority is not another subclass. It is closing trainer input/output row accounting for promoted samples. When lookahead returns `B + Delta_k` generation rows, trainer input batch must also contain `B + Delta_k` input rows before `DataProto.union()`.
+Current code already closes trainer input/output row accounting for promoted samples. `AsyncSkdDataSource.record_promoted()` stores matched input/output pairs, and trainer consumes them through `pop_promoted_pairs()`. When lookahead returns `B + Delta_k` generation rows, trainer input batch is expanded to the same row count before `DataProto.union()`. Only a DP-divisible number of promoted rows is appended; the rest remain pending in the source ledger.
 
 ### 9.2 New Config Keys
 
-Suggested config namespace:
+Implemented config path:
 
 ```yaml
-async_skd_lookahead:
-  enable: false
-  persistent_rollout_engines: true
-  prefetch_admission_ratio: 0.25
-  prefetch_pair_quota: true
-  max_old_gen_chunks: 16
-  promote_finished: true
-  tool_macro_step_atomic: true
-  source_aware_metrics: true
+actor_rollout_ref:
+  rollout:
+    agent:
+      agent_loop_manager_class: verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager
+      async_skd_mode: lookahead
+      async_skd_prefetch_limit: 64
+      async_skd_prefetch_worker_target: 20
 ```
 
 Derived values:
 
 ```text
-L_prefetch = min(B / N_pair, prefetch_admission_ratio * B)
+prefetch_limit = min(async_skd_prefetch_limit, current_step_item_count)
+worker_capacity = ceil(current_step_item_count / num_agent_loop_workers)
+prefetch_worker_target = worker_capacity if configured target <= 0 else min(target, worker_capacity)
 ```
+
+`PREFETCH_LIMIT=0` disables lookahead admission only. It does not make the run identical to synchronous SKD because current work still uses `AsyncSkdAgentLoopManager` sample-level scheduling.
 
 ### 9.3 Per-Sample Type Discipline
 
@@ -1138,14 +1140,14 @@ Completed sample의 실체는 `DataProto`다. Partial sample의 실체는 `SkdPa
 Manager 내부 task bookkeeping은 다음 정도로 충분하다.
 
 ```python
-current_active: dict[asyncio.Task, tuple[int, int]]
-lookahead_active: dict[asyncio.Task, tuple[int, int]]
+current_active: dict[asyncio.Task, dict[str, Any]]
+lookahead_active: dict[asyncio.Task, dict[str, Any]]
 current_completed: list[DataProto | None]
 promoted_lookahead: list[tuple[int, AsyncSkdSample]]
 carryover_partials: list[tuple[int, SkdPartialState]]
 ```
 
-새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`은 worker call 인자와 반환되는 `AsyncSkdSample`/`SkdPartialState`에 이미 있다. Active task 값은 `(output_or_admission_order, worker_idx)` tuple이면 충분하다. Completed lookahead도 최종 `DataProto` 반환 직전까지 `AsyncSkdSample` envelope로 보존한다. 그래야 `source.record_promoted(...)`가 `sample_id`를 잃지 않는다.
+새 `LookaheadTaskState`는 만들지 않는다. `sample_id`, `source_type`, `logical_step`, `worker_idx`, `launch_ts`는 active task metadata dict와 worker call 인자에 있다. Completed lookahead도 최종 `DataProto` 반환 직전까지 `AsyncSkdSample` envelope로 보존한다. 그래야 `source.record_promoted(...)`가 `sample_id`와 matched input row를 잃지 않는다.
 
 ```python
 @dataclass
@@ -1455,7 +1457,8 @@ EOS 없음 + open tool-call prefix:
   export 가능
 
 EOS 없음 + closed </tool_call>:
-  export 금지
+  export 가능
+  parser는 실행하지 않고 다음 resume에서 assistant generation을 이어간다.
 
 EOS 있음 + valid tool call:
   PROCESSING_TOOLS로 진행, tool result append 후 next_state == GENERATING에서 export 가능
@@ -1627,17 +1630,18 @@ The row order of these two concatenations must match exactly. Otherwise `uid`, r
 
 Carry-over current work has one extra trainer-side rule. The fresh rows are converted to generation prompts with `_get_gen_batch(fresh_batch)`, while the combined `current_input_batch` must separately be converted to trainer-ready input rows with `_prepare_async_skd_current_input_batch(current_input_batch)`. This removes generation-only non-tensor fields before `DataProto.union()`.
 
-## 13. Recommended MVP
+## 13. Current MVP
 
 MVP should be conservative.
 
-Config:
+Implemented config:
 
 ```text
-prefetch_admission_budget = min(B / N_pair, 0.25B)
-max_old_gen_chunks = 16
+async_skd_mode = lookahead
+async_skd_prefetch_limit = 64
+async_skd_prefetch_worker_target = 20
 promote_finished = true
-partial_rollout = false
+carryover_resume = true
 ```
 
 Scope:
@@ -1650,19 +1654,25 @@ Scope:
 - No mid-tool interruption
 - No live KV cache resume
 
-Implementation priority after the current MVP state:
+Implemented pieces:
 
 ```text
-1. promoted input batch assembly
-2. stale budget enforcement
-3. lookahead admission while completing carry-over + fresh current work
-4. source checkpoint integration
-5. source-aware metrics
-6. config schema
-7. persistent rollout/trainer split and weight sync
+1. promoted input/output pair assembly
+2. carryover + fresh current work scheduling
+3. worker-slot lookahead admission
+4. source checkpoint state
+5. event-log and dashboard observability
+6. compact W&B step metrics
 ```
 
-This order keeps row accounting correct before adding more concurrency.
+Not implemented in the current code:
+
+```text
+1. separate async_skd_max_old_gen_chunks cap
+2. exact IS correction
+3. live KV-cache resume across carryover
+4. rollout.n > 1 semantics
+```
 
 ## 14. Paper Framing
 
@@ -1731,13 +1741,13 @@ long-tail idle을 직접 줄임
 
 하지만 현재 fully async agent loop는 distillation이 켜져 있으면 막혀 있다. 또한 기존 queue는 full일 때 oldest sample을 drop하는 방식이라 SKD에는 맞지 않는다. 초기 SKD path는 Ray actor queue를 만들지 않고 `AsyncSkdAgentLoopManager` 내부 state로 처리한다.
 
-SKD async path에서는 다음이 필요하다.
+SKD async path currently uses:
 
 - silent drop 없는 manager-local sample accounting
 - teacher row alignment를 보존하는 partial state
 - tool macro-step atomicity
-- committed generation chunk cap
-- `k+2` 이상 prefetch 금지
+- SKD 본체의 `distillation.skd.max_chunks_per_sample`
+- step-local lookahead budget과 source ledger
 
 For the current manager-local design, reuse only the active-task pattern:
 

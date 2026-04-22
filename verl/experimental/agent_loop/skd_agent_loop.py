@@ -25,6 +25,7 @@ eliminating the need for a separate teacher logprob computation in postprocessin
 """
 
 from copy import deepcopy
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -38,8 +39,10 @@ import torch
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
     register,
+    rollout_trace_op,
 )
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.utils.profiler import simple_timer
 
@@ -180,7 +183,39 @@ class SkdAgentLoop(ToolAgentLoop):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        output.extra_fields.setdefault("parent_request_id", None)
         return output
+
+    async def _release_teacher_sticky_session(self, request_id: str) -> None:
+        if self.teacher_server_manager is None:
+            return
+        release = getattr(self.teacher_server_manager, "release_sticky_session", None)
+        if release is None:
+            return
+        result = release(request_id)
+        if inspect.isawaitable(result):
+            await result
+
+    @rollout_trace_op
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        agent_data = await self._init_boundary_agent_data(**kwargs)
+        try:
+            state = AgentState.PENDING
+            while state != AgentState.TERMINATED:
+                if state == AgentState.PENDING:
+                    state = await self._handle_pending_state(agent_data, sampling_params)
+                elif state == AgentState.GENERATING:
+                    state = await self._handle_generating_state(agent_data, sampling_params)
+                elif state == AgentState.PROCESSING_TOOLS:
+                    state = await self._handle_processing_tools_state(agent_data)
+                elif state == AgentState.INTERACTING:
+                    state = await self._handle_interacting_state(agent_data)
+                else:
+                    logger.error(f"Invalid state: {state}")
+                    state = AgentState.TERMINATED
+            return self._finalize_boundary_agent_output(agent_data)
+        finally:
+            await self._release_teacher_sticky_session(agent_data.request_id)
 
     def _append_student_prompt_delta_to_teacher_stream(self, agent_data: AgentData, prev_prompt_len: int) -> None:
         teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
@@ -202,6 +237,16 @@ class SkdAgentLoop(ToolAgentLoop):
         teacher_logprobs_list = agent_data.extra_fields["teacher_logprobs_list"]
         teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(count)])
         teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(count)])
+
+    @staticmethod
+    def _current_multi_modal_data(agent_data: AgentData) -> dict[str, Any]:
+        """Build current multimodal context for student/teacher rollout calls."""
+        multi_modal_data = {}
+        if agent_data.image_data is not None:
+            multi_modal_data["images"] = agent_data.image_data
+        if agent_data.video_data is not None:
+            multi_modal_data["videos"] = agent_data.video_data
+        return multi_modal_data
 
     def _increment_skd_prefix_stats(
         self,
@@ -241,19 +286,13 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data.extra_fields.setdefault("rollout_birth_version", new_min)
 
     def _is_qwen_hermes_exportable_assistant_prefix(self, agent_data: AgentData) -> bool:
-        """Return whether current assistant prefix may be exported before the next chunk."""
-        if not agent_data.response_ids:
-            return True
+        """Return whether current assistant prefix may be exported before the next chunk.
 
-        text = self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=False)
-        has_closed_tool_block = "</tool_call>" in text
-        if not has_closed_tool_block:
-            return True
-
-        eos_token_id = self.tokenizer.eos_token_id
-        eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
-        has_eos = any(token_id in eos_ids for token_id in agent_data.response_ids)
-        return has_eos
+        Tool parsing still only happens after EOS in ``_handle_generating_state``.
+        A closed ``</tool_call>`` without EOS is therefore just a resumable
+        generation prefix, not an executable tool call.
+        """
+        return True
 
     def _can_export_partial_state(self, agent_data: AgentData, next_state: AgentState) -> bool:
         """Return whether the current trajectory can be snapshotted for resume."""
@@ -439,17 +478,20 @@ class SkdAgentLoop(ToolAgentLoop):
         else:
             agent_data, state = self._restore_partial_state(partial_state)
 
-        next_state = await self._run_until_exportable_boundary(agent_data, state, sampling_params)
-        if next_state == AgentState.TERMINATED:
-            return self._finalize_boundary_agent_output(agent_data)
+        try:
+            next_state = await self._run_until_exportable_boundary(agent_data, state, sampling_params)
+            if next_state == AgentState.TERMINATED:
+                return self._finalize_boundary_agent_output(agent_data)
 
-        return self._export_partial_state(
-            agent_data,
-            next_state,
-            sample_id=sample_id,
-            logical_step=logical_step,
-            source_type=source_type,
-        )
+            return self._export_partial_state(
+                agent_data,
+                next_state,
+                sample_id=sample_id,
+                logical_step=logical_step,
+                source_type=source_type,
+            )
+        finally:
+            await self._release_teacher_sticky_session(agent_data.request_id)
 
     async def run_from_partial_to_completion(
         self,
@@ -459,8 +501,14 @@ class SkdAgentLoop(ToolAgentLoop):
     ) -> AgentLoopOutput:
         """Resume a partial SKD trajectory and run it to terminal completion."""
         agent_data, state = self._restore_partial_state(partial_state)
-        await self._run_until_terminated(agent_data, state, sampling_params)
-        return self._finalize_boundary_agent_output(agent_data)
+        parent_request_id = agent_data.request_id
+        agent_data.extra_fields["parent_request_id"] = parent_request_id
+        agent_data.request_id = uuid4().hex
+        try:
+            await self._run_until_terminated(agent_data, state, sampling_params)
+            return self._finalize_boundary_agent_output(agent_data)
+        finally:
+            await self._release_teacher_sticky_session(agent_data.request_id)
 
     def _assert_teacher_alignment(self, agent_data: AgentData) -> None:
         """Validate that response_mask and teacher rows stay response-token aligned."""
@@ -624,7 +672,7 @@ class SkdAgentLoop(ToolAgentLoop):
                             request_id=agent_data.request_id,
                             sequence_ids=verify_sequence,
                             logprob_start_len=logprob_start_len,
-                            multi_modal_data=agent_data.extra_fields.get("multi_modal_data"),
+                            multi_modal_data=self._current_multi_modal_data(agent_data),
                         )
                     )
                 teacher_ms = (time.monotonic() - teacher_t0) * 1000
@@ -714,6 +762,20 @@ class SkdAgentLoop(ToolAgentLoop):
 
                 self._assert_teacher_alignment(agent_data)
                 self._increment_skd_prefix_stats(agent_data, gen_chunks=1, tokens=len(new_tokens))
+                emit_async_skd_event(
+                    "chunk_commit",
+                    request_id=agent_data.request_id,
+                    chunk_idx=skd_metrics["chunk_count"],
+                    student_ms=student_ms,
+                    teacher_ms=teacher_ms,
+                    chunk_len=len(chunk),
+                    accepted=len(new_tokens) - (1 if rejection_pos is not None else 0),
+                    rejected=1 if rejection_pos is not None else 0,
+                    new_tokens=len(new_tokens),
+                    response_len=len(agent_data.response_mask),
+                    committed_gen_chunks=int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0)),
+                    committed_prefix_tokens=int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0)),
+                )
 
                 # 5. Termination checks within chunk loop
                 # Note: stop_reason == "completed" covers both EOS and max_tokens,
