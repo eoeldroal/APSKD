@@ -540,6 +540,276 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _ensure_batch_uid(self, batch: DataProto) -> None:
+        if "uid" in batch.non_tensor_batch:
+            return
+        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch))], dtype=object)
+
+    def _async_skd_mode(self) -> str:
+        mode = OmegaConf.select(self.config, "actor_rollout_ref.rollout.agent.async_skd_mode", default=None)
+        if mode is None:
+            mode = OmegaConf.select(self.config, "distillation.async_skd.mode", default="sync")
+        return str(mode)
+
+    def _is_async_skd_lookahead_enabled(self) -> bool:
+        return self._async_skd_mode() == "lookahead"
+
+    def _async_skd_base_batch_size(self) -> int:
+        return int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
+
+    def _validate_async_skd_lookahead_constraints(self) -> None:
+        rollout_n = int(OmegaConf.select(self.config, "actor_rollout_ref.rollout.n", default=1))
+        if rollout_n != 1:
+            raise ValueError(f"async SKD lookahead requires rollout.n == 1, got {rollout_n}")
+
+        adv_estimator = self.config.algorithm.adv_estimator
+        if str(adv_estimator).lower() == "remax" or adv_estimator == AdvantageEstimator.REMAX:
+            raise ValueError("async SKD lookahead does not support REMAX yet")
+
+        rollout_skip_enabled = bool(
+            OmegaConf.select(self.config, "actor_rollout_ref.rollout.skip.enable", default=False)
+        )
+        if rollout_skip_enabled:
+            raise ValueError("async SKD lookahead does not support rollout skip yet")
+
+        if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+            raise ValueError("async SKD lookahead does not support curriculum sampler yet")
+
+        if not hasattr(self.async_rollout_manager, "set_async_skd_data_source"):
+            raise ValueError("async SKD lookahead requires AsyncSkdAgentLoopManager-compatible rollout manager")
+
+    def _create_async_skd_batch_iterator(self):
+        steps_per_epoch = len(self.train_dataloader)
+        global_steps = int(getattr(self, "global_steps", 0))
+        current_epoch = global_steps // steps_per_epoch if steps_per_epoch > 0 else 0
+        total_epochs = int(OmegaConf.select(self.config, "trainer.total_epochs", default=current_epoch + 1))
+        for _ in range(current_epoch, total_epochs):
+            for batch_dict in self.train_dataloader:
+                yield batch_dict
+
+    def _ensure_async_skd_data_source(self):
+        source = getattr(self, "_async_skd_data_source", None)
+        if source is None:
+            from verl.experimental.async_skd.data_source import AsyncSkdDataSource
+
+            source = AsyncSkdDataSource(self._create_async_skd_batch_iterator())
+            source_state = getattr(self, "_async_skd_data_source_state_to_load", None)
+            if source_state is not None:
+                source.load_state_dict(source_state)
+                self._async_skd_data_source_state_to_load = None
+            self._async_skd_data_source = source
+            self.async_rollout_manager.set_async_skd_data_source(source)
+        return source
+
+    def _build_dataloader_checkpoint_state(
+        self,
+        dataloader_state_dict: dict,
+        *,
+        async_skd_source: Any | None = None,
+    ) -> dict:
+        source = async_skd_source
+        if source is None:
+            source = getattr(self, "_async_skd_data_source", None)
+        if not self._is_async_skd_lookahead_enabled() or source is None:
+            return dataloader_state_dict
+        return {
+            "format": "async_skd_data_state_v1",
+            "dataloader_state_dict": dataloader_state_dict,
+            "async_skd_data_source_state_dict": source.state_dict(),
+        }
+
+    def _split_dataloader_checkpoint_state(self, saved_state: Any) -> tuple[Any, dict | None]:
+        if (
+            isinstance(saved_state, dict)
+            and saved_state.get("format") == "async_skd_data_state_v1"
+            and "dataloader_state_dict" in saved_state
+        ):
+            return saved_state["dataloader_state_dict"], saved_state.get("async_skd_data_source_state_dict")
+        return saved_state, None
+
+    def _async_skd_source_state_has_pending_work(self, source_state: dict | None) -> bool:
+        if not source_state:
+            return False
+        fresh_buffer = source_state.get("fresh_buffer")
+        fresh_cursor = int(source_state.get("fresh_cursor", 0))
+        has_fresh_buffer = fresh_buffer is not None and fresh_cursor < len(fresh_buffer)
+        return bool(
+            has_fresh_buffer
+            or source_state.get("carryover_partials")
+            or source_state.get("carryover_input_batches")
+            or source_state.get("reserved_input_batches")
+            or source_state.get("promoted_input_batches")
+            or source_state.get("promoted_output_batches")
+        )
+
+    def _append_async_skd_promoted_inputs(self, batch: DataProto) -> DataProto:
+        self._async_skd_last_promoted_rows_appended = 0
+        source = getattr(self, "_async_skd_data_source", None)
+        if source is None or not hasattr(source, "pop_promoted_pairs"):
+            return batch
+
+        promoted_inputs, _ = source.pop_promoted_pairs()
+        if not promoted_inputs:
+            return batch
+
+        train_ready_promoted_inputs = []
+        for promoted_input in promoted_inputs:
+            self._ensure_batch_uid(promoted_input)
+            self._get_gen_batch(promoted_input)
+            train_ready_promoted_inputs.append(promoted_input)
+
+        self._async_skd_last_promoted_rows_appended = len(train_ready_promoted_inputs)
+        return DataProto.concat([batch] + train_ready_promoted_inputs)
+
+    def _async_skd_appendable_promoted_count(self, *, current_rows: int, promoted_available: int) -> int:
+        if promoted_available <= 0:
+            return 0
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        remainder = (current_rows + promoted_available) % dp_size
+        return max(0, promoted_available - remainder)
+
+    def _actor_update_batch_controls(self, *, batch_size: int, ppo_mini_batch_size: int) -> dict[str, Any]:
+        if self._is_async_skd_lookahead_enabled():
+            return {
+                "global_batch_size": int(batch_size),
+                "num_mini_batch": 1,
+            }
+        return {
+            "global_batch_size": ppo_mini_batch_size,
+            "mini_batch_size": ppo_mini_batch_size,
+        }
+
+    def _record_async_skd_current_batch_metrics(
+        self,
+        metrics: dict[str, Any],
+        *,
+        carryover_partials: list[Any],
+        fresh_batch: DataProto | None,
+        current_input_batch: DataProto,
+    ) -> None:
+        if not self._is_async_skd_lookahead_enabled():
+            return
+
+        base_batch_size = self._async_skd_base_batch_size()
+        carryover_count = len(carryover_partials)
+        fresh_count = len(fresh_batch) if fresh_batch is not None else 0
+        current_input_count = len(current_input_batch)
+        fresh_quota = max(0, base_batch_size - carryover_count)
+        metrics.update(
+            {
+                "async_skd/current_carryover_count": carryover_count,
+                "async_skd/current_fresh_count": fresh_count,
+                "async_skd/current_carryover_ratio": carryover_count / max(base_batch_size, 1),
+            }
+        )
+
+        print(
+            "[ASYNC_SKD] step_input "
+            f"step={self.global_steps} base={base_batch_size} carryover={carryover_count} "
+            f"fresh_quota={fresh_quota} fresh={fresh_count} current_input={current_input_count}",
+            flush=True,
+        )
+
+    def _record_async_skd_post_generation_metrics(
+        self,
+        metrics: dict[str, Any],
+        *,
+        batch: DataProto,
+        gen_batch_output: DataProto,
+    ) -> tuple[DataProto, DataProto]:
+        if not self._is_async_skd_lookahead_enabled():
+            return batch, gen_batch_output
+
+        rollout_metrics = gen_batch_output.meta_info.pop("async_skd_metrics", None)
+        if rollout_metrics:
+            metrics.update(rollout_metrics)
+
+        source = getattr(self, "_async_skd_data_source", None)
+        promoted_available = int(source.promoted_count()) if source is not None and hasattr(source, "promoted_count") else 0
+        promoted_append_count = self._async_skd_appendable_promoted_count(
+            current_rows=len(batch),
+            promoted_available=promoted_available,
+        )
+        promoted_inputs: list[DataProto] = []
+        promoted_outputs: list[DataProto] = []
+        if promoted_append_count > 0 and source is not None and hasattr(source, "pop_promoted_pairs"):
+            promoted_inputs, promoted_outputs = source.pop_promoted_pairs(max_count=promoted_append_count)
+            train_ready_promoted_inputs = []
+            for promoted_input in promoted_inputs:
+                self._ensure_batch_uid(promoted_input)
+                self._get_gen_batch(promoted_input)
+                train_ready_promoted_inputs.append(promoted_input)
+            batch = DataProto.concat([batch] + train_ready_promoted_inputs)
+            gen_batch_output = DataProto.concat([gen_batch_output] + promoted_outputs)
+
+        promoted_rows_appended = len(promoted_inputs)
+        promoted_rows_pending = promoted_available - promoted_rows_appended
+        metrics.update(
+            {
+                "async_skd/promoted_rows_appended": promoted_rows_appended,
+                "async_skd/promoted_rows_pending": promoted_rows_pending,
+            }
+        )
+        return batch, gen_batch_output
+
+    def _record_async_skd_union_metrics(
+        self,
+        metrics: dict[str, Any],
+        *,
+        train_batch_before_union: DataProto,
+        gen_batch_output: DataProto,
+        final_batch: DataProto,
+    ) -> None:
+        if not self._is_async_skd_lookahead_enabled():
+            return
+
+        train_rows = len(train_batch_before_union)
+        gen_rows = len(gen_batch_output)
+        final_rows = len(final_batch)
+        row_delta = train_rows - gen_rows
+        promoted_rows_appended = int(metrics.get("async_skd/promoted_rows_appended", 0))
+        metrics.update(
+            {
+                "async_skd/final_train_batch_size": final_rows,
+                "async_skd/promoted_append_ratio": promoted_rows_appended / max(final_rows, 1),
+            }
+        )
+        print(
+            "[ASYNC_SKD] train "
+            f"step={self.global_steps} promoted_appended={metrics.get('async_skd/promoted_rows_appended', 0)} "
+            f"train_before_union={train_rows} gen_output={gen_rows} "
+            f"row_delta={row_delta} final_train={final_rows}",
+            flush=True,
+        )
+
+    def _prepare_async_skd_current_input_batch(self, batch: DataProto) -> DataProto:
+        """Mutate current input rows into trainer-ready rows.
+
+        Carry-over current work uses a separate fresh generation batch, so the
+        combined current input batch still contains generation-only non-tensor
+        fields.  Strip those fields with the same rule as ``_get_gen_batch`` so
+        later ``batch.union(gen_batch_output)`` receives train input rows only.
+        """
+        self._ensure_batch_uid(batch)
+        self._get_gen_batch(batch)
+        return batch
+
+    def _iter_training_batches(self):
+        if not self._is_async_skd_lookahead_enabled():
+            for batch_dict in self.train_dataloader:
+                batch = DataProto.from_single_dict(batch_dict)
+                yield [], batch, batch
+            return
+
+        self._validate_async_skd_lookahead_constraints()
+        source = self._ensure_async_skd_data_source()
+        base_batch_size = self._async_skd_base_batch_size()
+        for _ in range(len(self.train_dataloader)):
+            carryover, fresh_batch, current_input_batch = source.next_current_batch(base_batch_size)
+            if current_input_batch is None:
+                break
+            yield carryover, fresh_batch, current_input_batch
+
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
         compute reward use colocate reward model
@@ -996,6 +1266,7 @@ class RayPPOTrainer:
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
+        dataloader_state_dict = self._build_dataloader_checkpoint_state(dataloader_state_dict)
         torch.save(dataloader_state_dict, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
@@ -1066,9 +1337,14 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
+            saved_data_state = torch.load(dataloader_local_path, weights_only=False)
+            dataloader_state_dict, async_skd_source_state = self._split_dataloader_checkpoint_state(saved_data_state)
+            if async_skd_source_state is not None:
+                self._async_skd_data_source_state_to_load = async_skd_source_state
             steps_per_epoch = len(self.train_dataloader)
             at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
-            if at_epoch_boundary:
+            source_has_pending_work = self._async_skd_source_state_has_pending_work(async_skd_source_state)
+            if at_epoch_boundary and not source_has_pending_work:
                 print(
                     f"Skipping dataloader state restore: global_steps={self.global_steps} "
                     f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
@@ -1076,7 +1352,6 @@ class RayPPOTrainer:
                     f"Next epoch will iterate from scratch."
                 )
             else:
-                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
@@ -1286,12 +1561,15 @@ class RayPPOTrainer:
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
+            batch_controls = self._actor_update_batch_controls(
+                batch_size=batch_td.batch_size[0],
+                ppo_mini_batch_size=ppo_mini_batch_size,
+            )
             tu.assign_non_tensor(
                 batch_td,
                 calculate_entropy=calculate_entropy,
                 distillation_use_topk=distillation_use_topk,
-                global_batch_size=ppo_mini_batch_size,
-                mini_batch_size=ppo_mini_batch_size,
+                **batch_controls,
                 epochs=ppo_epochs,
                 seed=seed,
                 dataloader_kwargs={"shuffle": shuffle},
@@ -1395,7 +1673,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for carryover_partials, fresh_batch, batch in self._iter_training_batches():
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1407,21 +1685,33 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                self._ensure_batch_uid(batch)
+                self._record_async_skd_current_batch_metrics(
+                    metrics,
+                    carryover_partials=carryover_partials,
+                    fresh_batch=fresh_batch,
+                    current_input_batch=batch,
                 )
 
-                gen_batch = self._get_gen_batch(batch)
+                if carryover_partials:
+                    gen_batch = self._get_gen_batch(fresh_batch) if fresh_batch is not None else None
+                    self._prepare_async_skd_current_input_batch(batch)
+                    gen_batch_output = None
+                    if gen_batch is not None:
+                        gen_batch.meta_info["global_steps"] = self.global_steps
+                        gen_batch_output = gen_batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
+                else:
+                    gen_batch = self._get_gen_batch(batch)
 
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1429,7 +1719,13 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        if carryover_partials:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences_with_carryover(
+                                fresh_prompts=gen_batch_output,
+                                carryover_partials=carryover_partials,
+                            )
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         self.checkpoint_manager.sleep_replicas()
                         import torch as _torch
                         if _torch.cuda.is_available():
@@ -1441,6 +1737,11 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        batch, gen_batch_output = self._record_async_skd_post_generation_metrics(
+                            metrics,
+                            batch=batch,
+                            gen_batch_output=gen_batch_output,
+                        )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1472,7 +1773,14 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    train_batch_before_union = batch
                     batch = batch.union(gen_batch_output)
+                    self._record_async_skd_union_metrics(
+                        metrics,
+                        train_batch_before_union=train_batch_before_union,
+                        gen_batch_output=gen_batch_output,
+                        final_batch=batch,
+                    )
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)

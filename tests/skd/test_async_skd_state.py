@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from verl.experimental.async_skd import AsyncSkdSample
-from verl.experimental.async_skd.state import SkdCommittedUnit, SkdPartialState
+from verl.experimental.async_skd.state import SkdPartialState
 from verl.protocol import DataProto
 
 
@@ -31,7 +31,6 @@ def make_partial() -> SkdPartialState:
         logical_step=5,
         source_type="lookahead_carryover",
         agent_state="generating",
-        last_committed_unit=SkdCommittedUnit.ASSISTANT_GEN_CHUNK_WITH_TOOL_RESULT.value,
         request_id="req-partial",
         rollout_birth_version=7,
         rollout_min_version=7,
@@ -121,7 +120,7 @@ def test_async_skd_sample_rejects_invalid_partial_envelope_mismatch():
         sample.validate()
 
 
-def test_async_skd_sample_rejects_unknown_source_type_and_non_resumable_unit():
+def test_async_skd_sample_rejects_unknown_source_type():
     with pytest.raises(ValueError, match="source_type"):
         AsyncSkdSample.from_completed(
             sample_id="bad-source",
@@ -129,8 +128,3 @@ def test_async_skd_sample_rejects_unknown_source_type_and_non_resumable_unit():
             source_type="unknown",
             batch=make_single_batch(),
         )
-
-    partial = make_partial()
-    partial.last_committed_unit = "NOT_RESUMABLE"
-    with pytest.raises(ValueError, match="not resumable"):
-        AsyncSkdSample.from_partial(partial_state=partial)

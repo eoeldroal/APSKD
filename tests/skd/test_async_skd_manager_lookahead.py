@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import numpy as np
@@ -11,7 +12,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.experimental.async_skd.manager import AsyncSkdAgentLoopManager
-from verl.experimental.async_skd.state import AsyncSkdSample, SkdCommittedUnit, SkdPartialState
+from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.protocol import DataProto
 
 
@@ -40,11 +41,19 @@ class _FakeLookaheadWorker:
         self.generate_skd_until_boundary = _RemoteMethod(self._generate_skd_until_boundary)
         self.generate_skd_from_partial_to_completion = _RemoteMethod(self._generate_skd_from_partial_to_completion)
 
-    async def _generate_sequence_single(self, sample: DataProto) -> DataProto:
+    async def _generate_sequence_single(
+        self,
+        sample: DataProto,
+        *,
+        async_skd_context: dict[str, Any] | None = None,
+    ) -> DataProto:
+        del async_skd_context
         input_pos = int(sample.non_tensor_batch["input_pos"][0])
         self._calls.append((self._name, "base", input_pos))
         await asyncio.sleep(self._base_delays.get(input_pos, 0.0))
-        return _make_output(input_pos)
+        output = _make_output(input_pos)
+        output.meta_info["metrics"][0]["rollout_server_id"] = self._name
+        return output
 
     async def _generate_skd_until_boundary(
         self,
@@ -54,7 +63,9 @@ class _FakeLookaheadWorker:
         sample_id: str,
         logical_step: int,
         source_type: str,
+        async_skd_context: dict[str, Any] | None = None,
     ) -> AsyncSkdSample:
+        del async_skd_context
         del logical_step, source_type
         if batch is not None:
             input_pos = int(batch.non_tensor_batch["input_pos"][0])
@@ -63,12 +74,24 @@ class _FakeLookaheadWorker:
             assert partial_state is not None
             self._calls.append((self._name, "resume", sample_id))
         await asyncio.sleep(0)
-        return self._lookahead_results[sample_id].pop(0)
+        sample = self._lookahead_results[sample_id].pop(0)
+        if sample.kind == "completed":
+            sample.require_completed().meta_info["metrics"][0]["rollout_server_id"] = self._name
+        return sample
 
-    async def _generate_skd_from_partial_to_completion(self, partial_state: SkdPartialState) -> AsyncSkdSample:
+    async def _generate_skd_from_partial_to_completion(
+        self,
+        partial_state: SkdPartialState,
+        *,
+        async_skd_context: dict[str, Any] | None = None,
+    ) -> AsyncSkdSample:
+        del async_skd_context
         self._calls.append((self._name, "carryover", partial_state.sample_id))
         await asyncio.sleep(0)
-        return self._lookahead_results[partial_state.sample_id].pop(0)
+        sample = self._lookahead_results[partial_state.sample_id].pop(0)
+        if sample.kind == "completed":
+            sample.require_completed().meta_info["metrics"][0]["rollout_server_id"] = self._name
+        return sample
 
 
 class _FakeLookaheadSource:
@@ -164,20 +187,19 @@ def _make_completed_sample(
     )
 
 
-def _make_partial(sample_id: str, logical_step: int = 4) -> SkdPartialState:
+def _make_partial(sample_id: str, logical_step: int = 4, committed_gen_chunks: int = 1) -> SkdPartialState:
     return SkdPartialState(
         sample_id=sample_id,
         logical_step=logical_step,
         source_type="lookahead",
         agent_state="generating",
-        last_committed_unit=SkdCommittedUnit.ASSISTANT_GEN_CHUNK.value,
         request_id=f"req-{sample_id}",
         response_ids=[1],
         response_mask=[1],
         rollout_birth_version=3,
         rollout_min_version=3,
         rollout_max_version=3,
-        committed_gen_chunks=1,
+        committed_gen_chunks=committed_gen_chunks,
         committed_env_units=0,
         committed_prefix_tokens=1,
         extra_fields={
@@ -187,8 +209,18 @@ def _make_partial(sample_id: str, logical_step: int = 4) -> SkdPartialState:
     )
 
 
-def _make_partial_sample(sample_id: str, logical_step: int = 4) -> AsyncSkdSample:
-    return AsyncSkdSample.from_partial(partial_state=_make_partial(sample_id, logical_step=logical_step))
+def _make_partial_sample(
+    sample_id: str,
+    logical_step: int = 4,
+    committed_gen_chunks: int = 1,
+) -> AsyncSkdSample:
+    return AsyncSkdSample.from_partial(
+        partial_state=_make_partial(
+            sample_id,
+            logical_step=logical_step,
+            committed_gen_chunks=committed_gen_chunks,
+        )
+    )
 
 
 def _make_manager(
@@ -198,6 +230,7 @@ def _make_manager(
     lookahead_results: dict[str, list[AsyncSkdSample]],
     base_delays: dict[int, float] | None = None,
     rollout_n: int = 1,
+    prefetch_worker_target: int | None = None,
 ):
     calls: list[tuple[str, str, Any]] = []
     manager = AsyncSkdAgentLoopManager.__new__(AsyncSkdAgentLoopManager)
@@ -209,6 +242,11 @@ def _make_manager(
                     "agent": {
                         "async_skd_mode": "lookahead",
                         "async_skd_prefetch_limit": prefetch_limit,
+                        **(
+                            {"async_skd_prefetch_worker_target": prefetch_worker_target}
+                            if prefetch_worker_target is not None
+                            else {}
+                        ),
                     },
                 }
             }
@@ -295,7 +333,64 @@ async def test_manager_generate_sequences_with_carryover_rejects_rollout_n_great
 
 
 @pytest.mark.asyncio
-async def test_lookahead_manager_promotes_completed_samples_after_base_outputs():
+async def test_carryover_path_records_promoted_for_trainer_append():
+    manager, calls, source = _make_manager(
+        prefetch_limit=2,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+        ],
+        lookahead_results={
+            "carry-200": [_make_completed_sample("carry-200", 200, source_type="resumed_current")],
+            "carry-201": [_make_completed_sample("carry-201", 201, source_type="resumed_current")],
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+        },
+        base_delays={0: 0.05, 1: 0.05},
+    )
+
+    output = await manager.generate_sequences_with_carryover(
+        fresh_prompts=_make_prompts(2),
+        carryover_partials=[_make_partial("carry-200"), _make_partial("carry-201")],
+    )
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [200, 201, 0, 1]
+    assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100", "lookahead-101"]
+    assert source.carryover_partials == []
+    assert [call[1] for call in calls].count("lookahead") == 2
+    assert output.meta_info["async_skd_metrics"]["async_skd/lookahead_started_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_carryover_path_drain_stops_lookahead_refill():
+    manager, calls, source = _make_manager(
+        prefetch_limit=8,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "carry-200": [_make_completed_sample("carry-200", 200, source_type="resumed_current")],
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+    )
+
+    await manager.generate_sequences_with_carryover(
+        fresh_prompts=None,
+        carryover_partials=[_make_partial("carry-200")],
+    )
+
+    assert [call[1] for call in calls].count("lookahead") == 0
+    assert len(source.source_items) == 4
+
+
+@pytest.mark.asyncio
+async def test_lookahead_manager_records_completed_promotions_without_appending_outputs():
     manager, calls, source = _make_manager(
         prefetch_limit=2,
         source_items=[
@@ -310,14 +405,12 @@ async def test_lookahead_manager_promotes_completed_samples_after_base_outputs()
 
     output = await manager.generate_sequences(_make_prompts(4))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 100, 101]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
     assert output.non_tensor_batch["payload"].tolist() == [
         "out-0",
         "out-1",
         "out-2",
         "out-3",
-        "out-100",
-        "out-101",
     ]
     assert manager._async_skd_carryover_partials == []
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100", "lookahead-101"]
@@ -341,7 +434,7 @@ async def test_lookahead_manager_carries_partial_and_excludes_it_from_train_batc
 
     output = await manager.generate_sequences(_make_prompts(4))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 101]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
     assert [partial.sample_id for partial in manager._async_skd_carryover_partials] == ["lookahead-100"]
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-101"]
     assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]
@@ -380,11 +473,34 @@ async def test_lookahead_manager_can_continue_partial_before_base_barrier_withou
 
     output = await manager.generate_sequences(_make_prompts(2))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 100]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
     assert manager._async_skd_carryover_partials == []
     assert [call[1] for call in calls].count("lookahead") == 1
     assert [call[1] for call in calls].count("resume") == 1
     assert source.source_items == []
+
+
+@pytest.mark.asyncio
+async def test_lookahead_manager_continues_partial_until_base_barrier_without_chunk_cap():
+    manager, calls, source = _make_manager(
+        prefetch_limit=1,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={
+            "lookahead-100": [
+                _make_partial_sample("lookahead-100", committed_gen_chunks=16),
+                _make_completed_sample("lookahead-100", 100),
+            ]
+        },
+        base_delays={1: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(2))
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
+    assert manager._async_skd_carryover_partials == []
+    assert source.carryover_partials == []
+    assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100"]
+    assert [call[1] for call in calls].count("resume") == 1
 
 
 @pytest.mark.asyncio
@@ -403,7 +519,7 @@ async def test_lookahead_manager_records_source_promoted_and_carryover_samples()
 
     output = await manager.generate_sequences(_make_prompts(4))
 
-    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3, 100]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
     assert source.reserved_steps == [4, 4]
     assert [sample.sample_id for sample in source.promoted_samples] == ["lookahead-100"]
     assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-101"]
@@ -424,6 +540,169 @@ def test_lookahead_manager_next_fresh_quota_ignores_promoted_count():
 
 
 @pytest.mark.asyncio
+async def test_lookahead_refills_the_worker_that_frees_a_slot_first():
+    manager, calls, source = _make_manager(
+        prefetch_limit=4,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+        base_delays={2: 0.05, 3: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+
+    lookahead_calls = [call for call in calls if call[1] == "lookahead"]
+    worker0_lookahead = [call for call in lookahead_calls if call[0] == "worker-0"]
+    worker1_lookahead = [call for call in lookahead_calls if call[0] == "worker-1"]
+
+    assert len(worker0_lookahead) > len(worker1_lookahead)
+    assert [sample.sample_id for sample in source.promoted_samples] == [
+        "lookahead-100",
+        "lookahead-101",
+        "lookahead-102",
+        "lookahead-103",
+    ]
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_lookahead_refill_does_not_exceed_worker_capacity():
+    manager, calls, _ = _make_manager(
+        prefetch_limit=4,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+        base_delays={2: 0.05, 3: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+
+    timing = output.meta_info["timing"]
+    metrics = output.meta_info["async_skd_metrics"]
+    assert not any(key.startswith("async_skd/") for key in timing)
+    assert metrics["async_skd/lookahead_started_count"] == 4
+    assert metrics["async_skd/lookahead_promoted_count"] == 4
+    assert metrics["async_skd/lookahead_carryover_count"] == 0
+    assert metrics["async_skd/worker_active_max"] <= 2
+    assert metrics["async_skd/lookahead_promote_rate"] == 1.0
+    assert metrics["async_skd/lookahead_carryover_rate"] == 0.0
+    assert [call[1] for call in calls].count("lookahead") == 4
+
+
+@pytest.mark.asyncio
+async def test_lookahead_refill_respects_prefetch_worker_target_below_current_capacity(tmp_path, monkeypatch):
+    event_path = tmp_path / "async_skd_events.jsonl"
+    monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    manager, calls, _ = _make_manager(
+        prefetch_limit=4,
+        prefetch_worker_target=1,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+        },
+        base_delays={2: 0.05, 3: 0.05},
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+
+    timing = output.meta_info["timing"]
+    metrics = output.meta_info["async_skd_metrics"]
+    assert not any(key.startswith("async_skd/") for key in timing)
+    assert metrics["async_skd/lookahead_started_count"] == 4
+    assert metrics["async_skd/worker_active_max"] <= 2
+    assert [call[1] for call in calls].count("lookahead") == 4
+
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    lookahead_launches = [
+        event for event in events if event["event"] == "sample_launch" and event.get("source_type") == "lookahead"
+    ]
+    assert len(lookahead_launches) == 4
+    assert all(event["prefetch_worker_target"] == 1 for event in lookahead_launches)
+    assert all(event["worker_active_after"] <= 1 for event in lookahead_launches)
+
+
+@pytest.mark.asyncio
+async def test_lookahead_refill_stops_after_base_barrier_drain():
+    manager, calls, source = _make_manager(
+        prefetch_limit=8,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+            ("lookahead-102", _make_source_sample(102)),
+            ("lookahead-103", _make_source_sample(103)),
+            ("lookahead-104", _make_source_sample(104)),
+            ("lookahead-105", _make_source_sample(105)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+            "lookahead-102": [_make_completed_sample("lookahead-102", 102)],
+            "lookahead-103": [_make_completed_sample("lookahead-103", 103)],
+            "lookahead-104": [_make_completed_sample("lookahead-104", 104)],
+            "lookahead-105": [_make_completed_sample("lookahead-105", 105)],
+        },
+    )
+
+    await manager.generate_sequences(_make_prompts(2))
+
+    lookahead_calls = [call for call in calls if call[1] == "lookahead"]
+    assert len(lookahead_calls) <= 2
+    assert len(source.source_items) >= 4
+
+
+@pytest.mark.asyncio
+async def test_lookahead_reports_compact_wandb_metrics_without_timing_namespace():
+    manager, _, _ = _make_manager(
+        prefetch_limit=2,
+        source_items=[
+            ("lookahead-100", _make_source_sample(100)),
+            ("lookahead-101", _make_source_sample(101)),
+        ],
+        lookahead_results={
+            "lookahead-100": [_make_completed_sample("lookahead-100", 100)],
+            "lookahead-101": [_make_completed_sample("lookahead-101", 101)],
+        },
+    )
+
+    output = await manager.generate_sequences(_make_prompts(4))
+    timing = output.meta_info["timing"]
+    metrics = output.meta_info["async_skd_metrics"]
+
+    assert not any(key.startswith("async_skd/") for key in timing)
+    assert metrics["async_skd/lookahead_started_count"] == 2
+    assert metrics["async_skd/lookahead_promoted_count"] == 2
+    assert metrics["async_skd/lookahead_carryover_count"] == 0
+    assert metrics["async_skd/lookahead_promote_rate"] == 1.0
+    assert metrics["async_skd/lookahead_carryover_rate"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_lookahead_manager_rejects_rollout_n_greater_than_one():
     manager, _, _ = _make_manager(
         prefetch_limit=1,
@@ -434,3 +713,39 @@ async def test_lookahead_manager_rejects_rollout_n_greater_than_one():
 
     with pytest.raises(ValueError, match="rollout.n == 1"):
         await manager.generate_sequences(_make_prompts(1))
+
+
+@pytest.mark.asyncio
+async def test_lookahead_manager_emits_realtime_scheduler_events(tmp_path, monkeypatch):
+    event_path = tmp_path / "async_skd_events.jsonl"
+    monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    manager, _, _ = _make_manager(
+        prefetch_limit=1,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={"lookahead-100": [_make_completed_sample("lookahead-100", 100)]},
+        base_delays={1: 0.02},
+    )
+
+    await manager.generate_sequences(_make_prompts(2))
+
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    current_launches = [
+        event
+        for event in events
+        if event["event"] == "sample_launch" and event["barrier_role"] == "current"
+    ]
+    lookahead_launches = [
+        event
+        for event in events
+        if event["event"] == "sample_launch" and event["barrier_role"] == "lookahead"
+    ]
+    assert len(current_launches) == 2
+    assert current_launches[0]["source_type"] == "base_current"
+    assert current_launches[0]["scheduler_worker_idx"] == 0
+    assert current_launches[0]["worker_capacity"] == 1
+    assert [event["sample_id"] for event in lookahead_launches] == ["lookahead-100"]
+    assert any(event["event"] == "sample_finish" and event["barrier_role"] == "current" for event in events)
+    drain_events = [event for event in events if event["event"] == "drain_start"]
+    assert len(drain_events) == 1
+    assert drain_events[0]["actual_lt_sample_id"]
+    assert drain_events[0]["current_completed"] == 2

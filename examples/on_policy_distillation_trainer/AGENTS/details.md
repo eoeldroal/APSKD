@@ -70,15 +70,29 @@ teacher를 크게 바꾸고 FP8로 올리면 자연스럽게 teacher memory나 t
 
 이 값은 “한 sample을 몇 토큰까지만 backprop한다”는 뜻이 아니다. 정확히는 GPU 한 장이 동시에 처리하는 총 token budget 상한에 가깝다. 값을 줄이면 한 번에 묶는 sample 수가 줄고, 필요하면 micro-batch 수가 늘어난다. 즉 학습 의미를 자르는 것이 아니라 동시 처리량을 낮춰 메모리를 맞추는 것이다. 다만 이 값만 조금 줄이는 미세 조정에는 한계가 있었다. 이미 12개 micro-batch까지 쪼개고도 OOM이 난 상황에서는 `18000 -> 16000` 같은 조정보다 `batch 128 -> 64`처럼 배치 자체를 줄이는 편이 더 직접적이었다.
 
-### 14. Nemotron train set은 mixed-task라는 점을 잊지 않는다
+### 14. `PREFETCH_LIMIT=0`은 동기 SKD가 아니다
+
+`PREFETCH_LIMIT=0`은 lookahead sample admission만 막는다. `actor_rollout_ref.rollout.agent.async_skd_mode=lookahead`와 `AsyncSkdAgentLoopManager`가 그대로 켜져 있으면 current batch는 여전히 sample-level async scheduling을 탄다. 따라서 이 설정은 “prefetch 없는 async manager ablation”이지 “기존 SKD baseline”이 아니다. 동기 baseline은 async manager를 끄거나 동기 SKD 실행 스크립트를 사용한다.
+
+### 15. Async SKD에서 promoted와 carryover는 학습 의미가 다르다
+
+promoted sample은 lookahead 중 terminal까지 끝난 sample이다. trainer는 source가 보관한 promoted input/output pair를 current batch 뒤에 붙이되, DP size divisibility를 만족하는 수만 붙인다. append되지 못한 promoted pair는 pending으로 남고 다음 기회에 학습 batch에 들어간다.
+
+carryover sample은 terminal이 아니라 exportable boundary에서 멈춘 partial이다. 다음 step의 current work 앞쪽에서 이어서 completion까지 간다. carryover는 fresh quota를 줄인다. promoted는 fresh quota를 줄이지 않는다.
+
+### 16. 지금 구현에는 `async_skd_max_old_gen_chunks` cap이 없다
+
+초기 설계 문서에는 stale continuation을 `async_skd_max_old_gen_chunks`로 제한하는 안이 있었지만, 현재 코드의 source of truth는 아니다. 현재 generation 종료 cap은 `distillation.skd.max_chunks_per_sample`이고, async lookahead는 current work가 남아 있는 동안 partial을 exportable boundary 단위로 재개한다. current가 모두 끝나면 남은 partial은 drain/carryover로 넘어간다.
+
+### 17. Nemotron train set은 mixed-task라는 점을 잊지 않는다
 
 `Nemotron-Cascade-RL-Math`는 단순 direct solving dataset이 아니다. 일반 수학 문제와 solution critique, earliest-error index task가 섞여 있다. 현재는 이걸 전부 train으로 쓴다. 따라서 전처리의 목적은 task를 억지로 하나로 바꾸는 것이 아니라 의미를 보존하는 데 있다. 현재 원칙은 `problem`을 그대로 쓰고, `answer`도 가공 없이 ground truth로 두며, `task_type`과 `source`를 추적 가능하게 남기고, `\boxed{}` carrier instruction만 제거하되 `decimal`, `base 10`, `without units` 같은 semantic format constraint는 유지하는 것이다.
 
-### 15. Reward는 대부분 버티지만, 모든 sample이 깔끔하다고 가정하면 안 된다
+### 18. Reward는 대부분 버티지만, 모든 sample이 깔끔하다고 가정하면 안 된다
 
 현재 reward는 사실상 `math_verify` 기반이고, 대부분의 direct math sample에는 잘 맞는다. 하지만 mixed-task dataset이므로 index answer, decimal/base-10 formatting, 드문 비수식 answer는 잠재 리스크다. 한동안 마지막 `\boxed{}`만 먼저 채점하거나 긴 unboxed 출력을 바로 `0`으로 두는 wrapper를 실험했지만, 실제 dump 기준으로 under-score가 확인되어 그 분기는 원복했다. 현재 운영 원칙은 다시 단순하다. `solution_str` 전체를 `math_verify`에 넘기는 기존 경로를 유지하고, parseability audit이나 reward 수정은 실제 failure pattern이 충분히 쌓였을 때만 좁혀 들어간다.
 
-### 16. `math_verify` hang 문제는 scorer만이 아니라 실행 경계를 같이 봐야 한다
+### 19. `math_verify` hang 문제는 scorer만이 아니라 실행 경계를 같이 봐야 한다
 
 한동안 base RL run이 step 후반에서 멈췄고, 표면상으로는 `RewardLoopWorker.compute_score`가 끝나지 않는 것처럼 보였다. 처음에는 단순히 scorer 안에 바깥 timeout만 더 두는 식으로 생각하기 쉽다. 그러나 실제 call chain은 `RewardLoopWorker -> NaiveRewardManager.run_single() -> run_in_executor(None, compute_score)`였고, 여기서 핵심은 `math_verify`가 내부 timeout 구현에 `signal.alarm()`을 쓴다는 점이었다.
 
@@ -88,7 +102,7 @@ teacher를 크게 바꾸고 FP8로 올리면 자연스럽게 teacher memory나 t
 
 다만 이것으로 구조 문제가 완전히 끝난 것은 아니다. 지금 패치는 `math_verify` 경로를 안전하게 만든 것이지, reward execution policy 전체를 일반화한 것은 아니다. 더 근본적으로는 `RewardLoopWorker` 또는 `NaiveRewardManager` 레벨에서 sync custom reward를 어떤 격리 경계에서 돌릴지, timeout/crash를 어떻게 처리할지, worker를 언제 recycle할지를 framework policy로 올리는 편이 맞다. 정리하면 현재 patch는 **현재 장애의 직접 원인에는 맞는 수정**이지만, 장기적으로는 reward isolation 자체를 scorer 바깥 계층으로 승격해야 한다.
 
-### 17. constrained decoding은 보류했다
+### 20. constrained decoding은 보류했다
 
 Hermes tool calling 위에 SGLang의 trigger-based constrained decoding을 붙이는 방향을 검토했고, 실제로 parser span 계산, `response_mask` 보정, `structural_tag` 주입까지 작은 프로토타입도 만들었다. 그러나 현재 `verl`의 SKD 구조와는 정합성이 충분하지 않아, 이번 축에서는 전부 원복했다.
 

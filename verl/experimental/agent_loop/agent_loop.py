@@ -32,6 +32,7 @@ from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
+from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.teacher_loop import TeacherModelManager
 from verl.protocol import DataProto
@@ -89,6 +90,8 @@ class GlobalRequestLoadBalancer:
             raise ValueError("server_actor_ids must be non-empty")
 
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in server_actor_ids}
+        self._active_sticky_sessions: dict[str, int] = {sid: 0 for sid in server_actor_ids}
+        self._active_request_ids: set[str] = set()
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
 
     def acquire_server(self, request_id: str) -> str:
@@ -96,12 +99,19 @@ class GlobalRequestLoadBalancer:
         # request-level sticky (multi-turn: same conversation -> same server)
         if request_id in self._request_id_to_server:
             server_id = self._request_id_to_server[request_id]
+            if request_id not in self._active_request_ids:
+                self._active_request_ids.add(request_id)
+                self._active_sticky_sessions[server_id] += 1
             self._inflight_requests[server_id] += 1
             return server_id
 
-        # new request: route to least loaded server
-        server_id = min(self._inflight_requests, key=self._inflight_requests.get)
+        # New sticky sessions are routed by active session ownership, not by
+        # transient in-flight request count. This keeps long SKD trajectories
+        # from piling up on a replica that happened to be briefly idle.
+        server_id = min(self._active_sticky_sessions, key=self._active_sticky_sessions.get)
         self._request_id_to_server[request_id] = server_id
+        self._active_request_ids.add(request_id)
+        self._active_sticky_sessions[server_id] += 1
         self._inflight_requests[server_id] += 1
         return server_id
 
@@ -112,6 +122,18 @@ class GlobalRequestLoadBalancer:
         if self._inflight_requests[server_id] <= 0:
             raise ValueError(f"Release called with no inflight requests on server {server_id}")
         self._inflight_requests[server_id] -= 1
+
+    def release_sticky_session(self, request_id: str) -> None:
+        """Mark a sticky request id as no longer active while keeping its server affinity."""
+        if request_id not in self._active_request_ids:
+            return
+        server_id = self._request_id_to_server.get(request_id)
+        if server_id is None:
+            self._active_request_ids.discard(request_id)
+            return
+        self._active_request_ids.remove(request_id)
+        if self._active_sticky_sessions[server_id] > 0:
+            self._active_sticky_sessions[server_id] -= 1
 
 
 def _get_rollout_and_model_config(config: DictConfig) -> tuple[DictConfig, DictConfig]:
@@ -158,6 +180,10 @@ class AsyncLLMServerManager:
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
 
+    async def release_sticky_session(self, request_id: str) -> None:
+        """Release active sticky-session load without dropping prefix-cache affinity."""
+        await self._load_balancer.release_sticky_session.remote(request_id=request_id)
+
     @rollout_trace_op
     async def generate(
         self,
@@ -182,9 +208,24 @@ class AsyncLLMServerManager:
         total_timer = monkey_patch_timing_begin(capture_gpu=True)
         acquire_timer = monkey_patch_timing_begin(capture_gpu=False)
         server_id, server = await self._acquire_server(request_id)
+        request_start_ts = time.time()
+        replica_role = "teacher" if self.__class__.__name__.startswith("AsyncTeacher") else "student"
+        request_kind = "teacher_verify" if replica_role == "teacher" else "student_generate"
+        request_instance_id = uuid4().hex
         _monkey_patch_log_timing(
             "AsyncLLMServerManager.generate.acquire_server",
             acquire_timer,
+            prompt_len=len(prompt_ids),
+            has_images=bool(image_data),
+            has_videos=bool(video_data),
+        )
+        emit_async_skd_event(
+            "replica_request_start",
+            role=replica_role,
+            replica_id=server_id,
+            request_id=request_id,
+            request_instance_id=request_instance_id,
+            request_kind=request_kind,
             prompt_len=len(prompt_ids),
             has_images=bool(image_data),
             has_videos=bool(video_data),
@@ -213,7 +254,36 @@ class AsyncLLMServerManager:
                 has_images=bool(image_data),
                 has_videos=bool(video_data),
             )
+            if hasattr(output, "extra_fields") and output.extra_fields is not None:
+                output.extra_fields["rollout_server_id"] = server_id
+            output_tokens = len(output.token_ids) if hasattr(output, "token_ids") and output.token_ids is not None else None
+            emit_async_skd_event(
+                "replica_request_finish",
+                role=replica_role,
+                replica_id=server_id,
+                request_id=request_id,
+                request_instance_id=request_instance_id,
+                request_kind=request_kind,
+                status="ok",
+                prompt_len=len(prompt_ids),
+                output_tokens=output_tokens,
+                duration_ms=(time.time() - request_start_ts) * 1000,
+            )
             return output
+        except Exception as exc:
+            emit_async_skd_event(
+                "replica_request_finish",
+                role=replica_role,
+                replica_id=server_id,
+                request_id=request_id,
+                request_instance_id=request_instance_id,
+                request_kind=request_kind,
+                status="error",
+                prompt_len=len(prompt_ids),
+                duration_ms=(time.time() - request_start_ts) * 1000,
+                error=repr(exc),
+            )
+            raise
         finally:
             release_timer = monkey_patch_timing_begin(capture_gpu=False)
             self._release_server(server_id)

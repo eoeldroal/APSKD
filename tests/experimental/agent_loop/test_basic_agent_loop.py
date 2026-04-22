@@ -523,6 +523,17 @@ class TestLoadBalancerRouting:
         s_new = ray.get(lb.acquire_server.remote(request_id="d"))
         assert s_new == "s2"
 
+    def test_new_sessions_route_by_active_sticky_session_load_not_transient_inflight(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(server_actor_ids=["s0", "s1"])
+        s0 = ray.get(lb.acquire_server.remote(request_id="long-session-0"))
+        assert s0 == "s0"
+        ray.get(lb.release_server.remote(server_id=s0))
+
+        # s0 now has zero inflight requests but still owns one active sticky session.
+        # New sessions should therefore go to s1, not back to s0 by dict order.
+        s1 = ray.get(lb.acquire_server.remote(request_id="long-session-1"))
+        assert s1 == "s1"
+
     def test_release_rebalances(self, ray_for_lb):
         lb = GlobalRequestLoadBalancer.remote(server_actor_ids=["s0", "s1"])
         s0 = ray.get(lb.acquire_server.remote(request_id="r0"))
@@ -556,3 +567,21 @@ class TestLoadBalancerStickySession:
         ray.get(lb.release_server.remote(server_id=s0))
         s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
         assert s0 == s1
+
+    def test_release_sticky_session_reduces_active_session_load_but_keeps_affinity(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(server_actor_ids=["s0", "s1"])
+        s0 = ray.get(lb.acquire_server.remote(request_id="conv-a"))
+        ray.get(lb.release_server.remote(server_id=s0))
+        s1 = ray.get(lb.acquire_server.remote(request_id="conv-b"))
+        ray.get(lb.release_server.remote(server_id=s1))
+        assert s0 != s1
+
+        ray.get(lb.release_sticky_session.remote(request_id="conv-a"))
+
+        # The sticky mapping remains, so conv-a still returns to s0.
+        assert ray.get(lb.acquire_server.remote(request_id="conv-a")) == s0
+        ray.get(lb.release_server.remote(server_id=s0))
+        ray.get(lb.release_sticky_session.remote(request_id="conv-a"))
+
+        # But active session load for s0 was released, so a new session should prefer s0.
+        assert ray.get(lb.acquire_server.remote(request_id="conv-c")) == s0

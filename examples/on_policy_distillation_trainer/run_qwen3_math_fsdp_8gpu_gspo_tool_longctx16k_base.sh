@@ -135,6 +135,6 @@ python3 -u -m verl.trainer.main_ppo \
     trainer.save_freq=10 \
     trainer.test_freq=50 \
     trainer.total_training_steps="$total_training_steps" \
-    trainer.total_epochs=2 \
+    trainer.total_epochs=5 \
     "$@" \
     2>&1 | tee "$log_dir/$experiment_name.log"
